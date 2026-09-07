@@ -20,6 +20,7 @@ import (
 	"cmp"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/saschagrunert/security-profiles-merger/landlock"
@@ -77,16 +78,8 @@ func fuzzLandlockProfile(
 	handledNet := pickNetRights(handledNetMask)
 	scoped := pickScopeRights(scopeMask)
 
-	if path1 == "" {
-		path1 = "/default1"
-	}
-
-	if path2 == "" {
-		path2 = "/default2"
-	}
-
-	path1 = filepath.Clean(path1)
-	path2 = filepath.Clean(path2)
+	path1 = fuzzPath(path1, "/default1")
+	path2 = fuzzPath(path2, "/default2")
 
 	pathRules := buildFuzzPathRules(
 		path1, path2,
@@ -103,6 +96,18 @@ func fuzzLandlockProfile(
 		PathRules:        pathRules,
 		NetRules:         netRules,
 	}
+}
+
+// fuzzPath cleans a fuzz-generated path and substitutes the fallback for
+// inputs Validate rejects: empty paths, paths that clean to ".", and paths
+// with NUL bytes.
+func fuzzPath(path, fallback string) string {
+	path = filepath.Clean(strings.ReplaceAll(path, "\x00", ""))
+	if path == "." {
+		return fallback
+	}
+
+	return path
 }
 
 func buildFuzzPathRules(
@@ -812,10 +817,14 @@ func assertUnionPathCoverage(
 		resultPaths[rule.Path] = struct{}{}
 	}
 
+	handled := fsRightSet(result.HandledAccessFS)
+
+	// Rights outside the merged handled set are pruned, so a rule survives
+	// only when it grants a handled right.
 	for _, input := range []*landlock.Profile{left, right} {
 		for _, rule := range input.PathRules {
 			if _, ok := resultPaths[rule.Path]; !ok &&
-				len(rule.AccessFS) > 0 {
+				len(handledFSRights(rule.AccessFS, handled)) > 0 {
 				t.Errorf("path %q missing from union", rule.Path)
 			}
 		}
@@ -922,19 +931,27 @@ func assertUnionPathRightsSuperset(
 	leftPaths := pathRuleMap(left.PathRules)
 	rightPaths := pathRuleMap(right.PathRules)
 
-	assertPathRightsPresent(t, leftPaths, rightPaths, resultPaths)
-	assertPathRightsPresent(t, rightPaths, leftPaths, resultPaths)
+	handled := fsRightSet(result.HandledAccessFS)
+
+	assertPathRightsPresent(t, leftPaths, rightPaths, resultPaths, handled)
+	assertPathRightsPresent(t, rightPaths, leftPaths, resultPaths, handled)
 }
 
 func assertPathRightsPresent(
 	t *testing.T,
 	source, other map[string][]landlock.FSAccessRight,
 	result map[string][]landlock.FSAccessRight,
+	handled map[landlock.FSAccessRight]struct{},
 ) {
 	t.Helper()
 
 	for path, access := range source {
 		if _, inOther := other[path]; !inOther {
+			continue
+		}
+
+		expected := handledFSRights(access, handled)
+		if len(expected) == 0 {
 			continue
 		}
 
@@ -947,12 +964,27 @@ func assertPathRightsPresent(
 
 		resultSet := fsRightSet(resultAccess)
 
-		for _, r := range access {
-			if _, ok := resultSet[r]; !ok {
-				t.Errorf("union path %q missing right %q", path, r)
+		for _, right := range expected {
+			if _, ok := resultSet[right]; !ok {
+				t.Errorf("union path %q missing right %q", path, right)
 			}
 		}
 	}
+}
+
+// handledFSRights returns the rights of access that are in handled.
+func handledFSRights(
+	access []landlock.FSAccessRight, handled map[landlock.FSAccessRight]struct{},
+) []landlock.FSAccessRight {
+	var kept []landlock.FSAccessRight
+
+	for _, right := range access {
+		if _, ok := handled[right]; ok {
+			kept = append(kept, right)
+		}
+	}
+
+	return kept
 }
 
 func assertUnionNetRightsSuperset(
@@ -965,19 +997,34 @@ func assertUnionNetRightsSuperset(
 	leftPorts := netRulePortMap(left.NetRules)
 	rightPorts := netRulePortMap(right.NetRules)
 
-	assertNetRightsPresent(t, leftPorts, rightPorts, resultPorts)
-	assertNetRightsPresent(t, rightPorts, leftPorts, resultPorts)
+	handled := netRightSet(result.HandledAccessNet)
+
+	assertNetRightsPresent(t, leftPorts, rightPorts, resultPorts, handled)
+	assertNetRightsPresent(t, rightPorts, leftPorts, resultPorts, handled)
 }
 
 func assertNetRightsPresent(
 	t *testing.T,
 	source, other map[uint16][]landlock.NetAccessRight,
 	result map[uint16][]landlock.NetAccessRight,
+	handled map[landlock.NetAccessRight]struct{},
 ) {
 	t.Helper()
 
 	for port, access := range source {
 		if _, inOther := other[port]; !inOther {
+			continue
+		}
+
+		var expected []landlock.NetAccessRight
+
+		for _, right := range access {
+			if _, ok := handled[right]; ok {
+				expected = append(expected, right)
+			}
+		}
+
+		if len(expected) == 0 {
 			continue
 		}
 
@@ -990,9 +1037,9 @@ func assertNetRightsPresent(
 
 		resultSet := netRightSet(resultAccess)
 
-		for _, r := range access {
-			if _, ok := resultSet[r]; !ok {
-				t.Errorf("union port %d missing right %q", port, r)
+		for _, right := range expected {
+			if _, ok := resultSet[right]; !ok {
+				t.Errorf("union port %d missing right %q", port, right)
 			}
 		}
 	}

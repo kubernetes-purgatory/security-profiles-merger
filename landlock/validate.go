@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strings"
 
 	"github.com/saschagrunert/security-profiles-merger/internal/merge"
 )
@@ -33,8 +34,13 @@ var (
 	// for the same path or port.
 	ErrDuplicateRule = errors.New("duplicate rule")
 
-	// ErrEmptyPath is returned when a path rule has an empty path string.
+	// ErrEmptyPath is returned when a path rule has an empty path string
+	// or a path that cleans to ".", such as "a/..".
 	ErrEmptyPath = merge.ErrEmptyPath
+
+	// ErrInvalidPath is returned when a path rule contains a NUL byte,
+	// which no file system path can contain.
+	ErrInvalidPath = errors.New("invalid path")
 
 	// ErrUnhandledRight is returned when a rule grants an access right
 	// that is not listed in the profile's handled access set.
@@ -49,10 +55,14 @@ var (
 	ErrRelativePath = errors.New("relative path (must be absolute)")
 )
 
-// Validate checks that a Landlock profile contains only known access
-// right values. Unknown values pass through merge silently, which may
-// produce unexpected results at enforcement time. All validation failures
-// are collected and returned together.
+// Validate checks that a Landlock profile contains only known access right
+// values, valid paths, and no duplicate rules or rights. Duplicate rules are
+// detected on cleaned paths, so "/etc" and "/etc/" count as the same rule.
+//
+// Intersect and Union normalize and deduplicate each input before running
+// Validate on it, so duplicate rules and rights within one input are merged
+// rather than rejected there. Call Validate directly to catch them. All
+// validation failures are collected and returned together.
 func Validate(profile *Profile) error {
 	if profile == nil {
 		return ErrNilProfile
@@ -121,7 +131,8 @@ func validateRights[T ~string](
 }
 
 // validateEmptyPathsBeforeNormalize catches empty paths before
-// filepath.Clean("") turns them into ".", which would bypass Validate.
+// filepath.Clean("") turns them into ".", so the error names the original
+// path.
 func validateEmptyPathsBeforeNormalize(profile *Profile) error {
 	if profile == nil {
 		return ErrNilProfile
@@ -130,29 +141,47 @@ func validateEmptyPathsBeforeNormalize(profile *Profile) error {
 	var errs []error
 
 	for idx, rule := range profile.PathRules {
-		if rule.Path == "" {
-			errs = append(errs, fmt.Errorf("PathRules[%d]: %w", idx, ErrEmptyPath))
+		err := validatePath(rule.Path)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("PathRules[%d]: %w", idx, err))
 		}
 	}
 
 	return errors.Join(errs...)
 }
 
-// validatePathRules checks path rules for empty paths, unknown rights, and
-// duplicate rights. The empty-path check here covers direct Validate callers;
-// foldProfiles also runs validateEmptyPathsBeforeNormalize to catch empty
-// paths before filepath.Clean turns them into ".".
+// validatePath rejects empty paths, paths that clean to ".", and paths with
+// NUL bytes.
+func validatePath(path string) error {
+	if path == "" {
+		return ErrEmptyPath
+	}
+
+	if strings.ContainsRune(path, 0) {
+		return fmt.Errorf("%q contains a NUL byte: %w", path, ErrInvalidPath)
+	}
+
+	if filepath.Clean(path) == "." {
+		return fmt.Errorf("%q resolves to %q: %w", path, ".", ErrEmptyPath)
+	}
+
+	return nil
+}
+
+// validatePathRules checks path rules for invalid paths, unknown rights, and
+// duplicate rights.
 func validatePathRules(rules []PathRule) []error {
 	var errs []error
 
 	for idx, rule := range rules {
-		if rule.Path == "" {
-			errs = append(errs, fmt.Errorf("PathRules[%d]: %w", idx, ErrEmptyPath))
+		err := validatePath(rule.Path)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("PathRules[%d]: %w", idx, err))
 		}
 
 		context := fmt.Sprintf("PathRules[%d]", idx)
 
-		err := validateRights(context, rule.AccessFS, isKnownFSRight)
+		err = validateRights(context, rule.AccessFS, isKnownFSRight)
 		if err != nil {
 			errs = append(errs, err)
 		}
@@ -232,31 +261,36 @@ func isKnownNetRight(right NetAccessRight) bool {
 	}
 }
 
+// validateDuplicatePaths detects rules for the same cleaned path, so that
+// "/etc" and "/etc/" are reported as duplicates just as the merge functions
+// would combine them.
 func validateDuplicatePaths(rules []PathRule) error {
 	seen := make(map[string]struct{}, len(rules))
 
 	var errs []error
 
 	for _, rule := range rules {
-		if _, ok := seen[rule.Path]; ok {
+		cleaned := filepath.Clean(rule.Path)
+
+		if _, ok := seen[cleaned]; ok {
 			errs = append(errs, fmt.Errorf("path %q: %w", rule.Path, ErrDuplicateRule))
 		}
 
-		seen[rule.Path] = struct{}{}
+		seen[cleaned] = struct{}{}
 	}
 
 	return errors.Join(errs...)
 }
 
 // ValidateStrict performs all checks from Validate and additionally verifies
-// that every rule's access rights are a subset of the corresponding handled
-// access set. In Landlock semantics, unhandled rights are implicitly allowed
-// everywhere, so granting an unhandled right in a rule is a no-op and likely
-// a configuration error.
+// that every path is absolute and that every rule's access rights are a
+// subset of the corresponding handled access set. In Landlock semantics,
+// unhandled rights are implicitly allowed everywhere, so granting an
+// unhandled right in a rule is a no-op that the kernel rejects with EINVAL
+// and likely a configuration error.
 //
-// Merge results may legitimately contain unhandled rights in rules (for
-// example, union intersects the handled sets while preserving rules from both
-// inputs). Use Validate for merge inputs and ValidateStrict for
+// Merge results never contain unhandled rights, since Intersect and Union
+// prune them. Use Validate for merge inputs and ValidateStrict for
 // user-authored profiles.
 func ValidateStrict(profile *Profile) error {
 	var errs []error

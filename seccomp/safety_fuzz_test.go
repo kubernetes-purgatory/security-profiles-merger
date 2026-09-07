@@ -33,9 +33,12 @@ import (
 //   - Union never denies a call that any input permits.
 //   - Both are idempotent and commutative in effect.
 //
-// The evaluator implements the model documented on seccomp.Intersect: among
-// matching conditional entries the least restrictive action applies, else
-// the unconditional entry, else the profile default.
+// The evaluator implements the model documented on seccomp.Intersect, which
+// follows how runc and libseccomp load a profile: entries equal to the
+// default are skipped, the first unconditional entry overrides every
+// conditional entry for its syscall, otherwise the least restrictive action
+// among matching conditional entries applies, else the profile default.
+// Several conditions on one argument index within an entry are alternatives.
 
 var (
 	safetyNames = []string{"read", "write", "clone", "socket"}
@@ -84,8 +87,9 @@ func (r *byteReader) exhausted() bool { return r.pos >= len(r.data) }
 
 // safetyProfile decodes a profile from fuzz bytes. Entries may repeat
 // syscall names, mix unconditional and conditional rules, and carry up to
-// two argument filters on indices 0 and 1.
-func safetyProfile(reader *byteReader) *specs.LinuxSeccomp {
+// two argument filters on indices 0 and 1. With errnos disabled, no
+// ErrnoRet is set anywhere.
+func safetyProfile(reader *byteReader, errnos bool) *specs.LinuxSeccomp {
 	const (
 		maxEntries = 6
 		maxArgs    = 2
@@ -96,7 +100,7 @@ func safetyProfile(reader *byteReader) *specs.LinuxSeccomp {
 		DefaultAction: safetyActions[int(reader.next())%len(safetyActions)],
 	}
 
-	if reader.next()%2 == 1 {
+	if reader.next()%2 == 1 && errnos {
 		errno := uint(reader.next())
 		profile.DefaultErrnoRet = &errno
 	}
@@ -111,7 +115,7 @@ func safetyProfile(reader *byteReader) *specs.LinuxSeccomp {
 			Action: safetyActions[int(reader.next())%len(safetyActions)],
 		}
 
-		if reader.next()%2 == 1 {
+		if reader.next()%2 == 1 && errnos {
 			errno := uint(reader.next())
 			entry.ErrnoRet = &errno
 		}
@@ -135,6 +139,16 @@ func safetyProfile(reader *byteReader) *specs.LinuxSeccomp {
 }
 
 func entryMatches(entry specs.LinuxSyscall, call []uint64) bool {
+	if repeatsIndex(entry.Args) {
+		for _, arg := range entry.Args {
+			if int(arg.Index) < len(call) && seccomp.CondHolds(arg, call[arg.Index]) {
+				return true
+			}
+		}
+
+		return false
+	}
+
 	for _, arg := range entry.Args {
 		if int(arg.Index) >= len(call) || !seccomp.CondHolds(arg, call[arg.Index]) {
 			return false
@@ -142,6 +156,36 @@ func entryMatches(entry specs.LinuxSyscall, call []uint64) bool {
 	}
 
 	return true
+}
+
+func repeatsIndex(args []specs.LinuxSeccompArg) bool {
+	seen := make(map[uint]struct{}, len(args))
+
+	for _, arg := range args {
+		if _, ok := seen[arg.Index]; ok {
+			return true
+		}
+
+		seen[arg.Index] = struct{}{}
+	}
+
+	return false
+}
+
+func equalsDefault(profile *specs.LinuxSeccomp, entry specs.LinuxSyscall) bool {
+	if !sameRestrictiveness(entry.Action, profile.DefaultAction) {
+		return false
+	}
+
+	if entry.Action != specs.ActErrno && entry.Action != specs.ActTrace {
+		return true
+	}
+
+	if entry.ErrnoRet == nil || profile.DefaultErrnoRet == nil {
+		return entry.ErrnoRet == nil && profile.DefaultErrnoRet == nil
+	}
+
+	return *entry.ErrnoRet == *profile.DefaultErrnoRet
 }
 
 // evalCall returns the action a profile applies to a call of the named
@@ -156,17 +200,11 @@ func evalCall(
 		hasUncond     bool
 	)
 
-	for _, entry := range profile.Syscalls {
-		if !slices.Contains(entry.Names, name) {
-			continue
-		}
-
+	for _, entry := range relevantEntries(profile, name) {
 		if len(entry.Args) == 0 {
 			if !hasUncond {
 				unconditional = entry.Action
 				hasUncond = true
-			} else {
-				unconditional = seccomp.LessRestrictive(unconditional, entry.Action)
 			}
 
 			continue
@@ -185,13 +223,27 @@ func evalCall(
 	}
 
 	switch {
-	case hasCond:
-		return conditional
 	case hasUncond:
 		return unconditional
+	case hasCond:
+		return conditional
 	default:
 		return profile.DefaultAction
 	}
+}
+
+// relevantEntries returns the entries a runtime loads for the named syscall:
+// those naming it whose action differs from the profile default.
+func relevantEntries(profile *specs.LinuxSeccomp, name string) []specs.LinuxSyscall {
+	var entries []specs.LinuxSyscall
+
+	for _, entry := range profile.Syscalls {
+		if slices.Contains(entry.Names, name) && !equalsDefault(profile, entry) {
+			entries = append(entries, entry)
+		}
+	}
+
+	return entries
 }
 
 // atMostAsPermissive reports whether first is at most as permissive as
@@ -240,12 +292,19 @@ func forEachCall(
 	}
 }
 
-func safetyInputs(t *testing.T, data []byte) (*specs.LinuxSeccomp, *specs.LinuxSeccomp) {
+// safetyInputs decodes two profiles. The first byte decides whether errno
+// values are generated at all. Commutativity is only asserted for errno-free
+// inputs: ErrnoRet ties resolve toward the leftmost profile, and whether a
+// conditional entry that shares the default action survives as a shield for
+// an overlapping stricter entry depends on that errno, so the two argument
+// orders can legitimately differ in effect.
+func safetyInputs(t *testing.T, data []byte) (*specs.LinuxSeccomp, *specs.LinuxSeccomp, bool) {
 	t.Helper()
 
 	reader := &byteReader{data: data, pos: 0}
-	left := safetyProfile(reader)
-	right := safetyProfile(reader)
+	errnos := reader.next()%2 == 1
+	left := safetyProfile(reader, errnos)
+	right := safetyProfile(reader, errnos)
 
 	err := seccomp.Validate(left)
 	if err != nil {
@@ -257,7 +316,7 @@ func safetyInputs(t *testing.T, data []byte) (*specs.LinuxSeccomp, *specs.LinuxS
 		t.Skip("invalid right input")
 	}
 
-	return left, right
+	return left, right, errnos
 }
 
 func addSafetySeeds(f *testing.F) {
@@ -266,28 +325,28 @@ func addSafetySeeds(f *testing.F) {
 	// Baseline with two conditional entries for the same syscall versus an
 	// unconditional allow.
 	f.Add([]byte{
-		4, 0, 2, 8, 0, 1, 0, 0, 3, 2, 8, 0, 1, 1, 0, 3,
+		0, 4, 0, 2, 8, 0, 1, 0, 0, 3, 2, 8, 0, 1, 1, 0, 3,
 		4, 0, 2, 8, 0, 0,
 	})
 	// Unconditional deny on one side, conditional allow on the other.
 	f.Add([]byte{
-		8, 0, 3, 4, 0, 0,
+		0, 8, 0, 3, 4, 0, 0,
 		8, 0, 3, 8, 0, 1, 2, 0, 3,
 	})
 	// Same profile shape twice, with an unconditional and a conditional
 	// entry for the same syscall.
 	f.Add([]byte{
-		8, 0, 3, 4, 0, 0, 3, 8, 0, 1, 2, 0, 3,
+		0, 8, 0, 3, 4, 0, 0, 3, 8, 0, 1, 2, 0, 3,
 		8, 0, 3, 4, 0, 0, 3, 8, 0, 1, 2, 0, 3,
 	})
 	// Overlapping ranges on the same index.
 	f.Add([]byte{
-		4, 0, 2, 8, 0, 1, 1, 0, 4,
+		0, 4, 0, 2, 8, 0, 1, 1, 0, 4,
 		4, 0, 2, 8, 0, 1, 5, 0, 2,
 	})
 	// Errno values everywhere.
 	f.Add([]byte{
-		4, 1, 13, 0, 4, 1, 42, 1, 3, 0, 3,
+		1, 4, 1, 13, 0, 4, 1, 42, 1, 3, 0, 3,
 		4, 1, 99, 0, 4, 1, 7, 0,
 	})
 }
@@ -296,7 +355,7 @@ func FuzzIntersectSafety(f *testing.F) {
 	addSafetySeeds(f)
 
 	f.Fuzz(func(t *testing.T, data []byte) {
-		left, right := safetyInputs(t, data)
+		left, right, errnos := safetyInputs(t, data)
 
 		result, err := seccomp.Intersect(left, right)
 		if err != nil {
@@ -337,7 +396,7 @@ func FuzzIntersectSafety(f *testing.F) {
 				)
 			}
 
-			if !sameRestrictiveness(got, evalCall(reversed, name, call)) {
+			if !errnos && !sameRestrictiveness(got, evalCall(reversed, name, call)) {
 				t.Errorf("%s%v: intersect is not commutative", name, call)
 			}
 
@@ -357,7 +416,7 @@ func FuzzUnionSafety(f *testing.F) {
 	addSafetySeeds(f)
 
 	f.Fuzz(func(t *testing.T, data []byte) {
-		left, right := safetyInputs(t, data)
+		left, right, errnos := safetyInputs(t, data)
 
 		result, err := seccomp.Union(left, right)
 		if err != nil {
@@ -398,7 +457,7 @@ func FuzzUnionSafety(f *testing.F) {
 				)
 			}
 
-			if !sameRestrictiveness(got, evalCall(reversed, name, call)) {
+			if !errnos && !sameRestrictiveness(got, evalCall(reversed, name, call)) {
 				t.Errorf("%s%v: union is not commutative", name, call)
 			}
 

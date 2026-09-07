@@ -85,11 +85,25 @@ in the [package reference](https://pkg.go.dev/github.com/saschagrunert/security-
   all. An empty flag list means "no flags", so intersecting with it yields no
   flags. This keeps an OCI-pulled profile from enabling
   `SECCOMP_FILTER_FLAG_SPEC_ALLOW` over a baseline that did not set it.
-- Evaluation model: within a profile, a syscall entry with argument filters
-  applies to calls matching all of its filters. If several conditional entries
-  match, the least restrictive action applies. If none matches, an
-  unconditional entry for the syscall applies, otherwise the profile default.
-  Multiple entries for the same syscall (an OR of filters) are preserved.
+- Evaluation model: entries are evaluated the way runc and libseccomp load
+  them. Entries whose action (and errno, for `ERRNO` and `TRACE`) equals the
+  profile default are ignored. An unconditional entry applies to every call of
+  its syscall and overrides conditional entries for the same syscall, because
+  libseccomp drops conditional rules once an unconditional rule exists; when
+  several unconditional entries exist, the first one wins. Otherwise a
+  conditional entry applies to calls matching all of its filters, and if
+  several conditional entries match, the least restrictive action applies. If
+  none matches, the profile default applies. Multiple entries for the same
+  syscall (an OR of filters) are preserved. An entry with several conditions
+  on the same argument index is loaded by runc as one rule per condition, so
+  it is treated as alternatives rather than a conjunction.
+- Merge results never carry an unconditional entry next to conditional
+  entries for the same syscall, since the runtime would discard the
+  conditional ones. Where the merged rules would need both, a single filter
+  is rewritten as the filter plus its complement (for example `arg0 == 1` and
+  `arg0 != 1`), which is exact; anything else collapses to one unconditional
+  entry with the more restrictive (intersection) or less restrictive (union)
+  action.
 - Argument filters during intersection: for each call, the more restrictive
   action of the two profiles is chosen. Filters on different argument indices
   are conjoined into one entry, identical filters are kept, and filters that
@@ -106,7 +120,12 @@ in the [package reference](https://pkg.go.dev/github.com/saschagrunert/security-
   are emitted as one multi-name entry, sorted by name.
 - `DefaultErrnoRet` is taken from whichever profile's default action is selected.
   When both profiles share the same action, the earlier (leftmost) profile's
-  `DefaultErrnoRet` wins. The same applies to per-syscall `ErrnoRet`.
+  `DefaultErrnoRet` wins. The same applies to per-syscall `ErrnoRet`. `ErrnoRet`
+  is only significant for `ERRNO` and `TRACE`; on other actions it is ignored
+  when comparing entries. Because of the leftmost rule, whether a conditional
+  entry that shares the default action but not its errno survives can depend
+  on argument order, so results are order-independent in effect only for
+  profiles without errno values.
 - `ListenerPath` and `ListenerMetadata` are taken from the first profile.
 
 **Action restrictiveness ordering** (most to least restrictive):
@@ -163,13 +182,19 @@ in the [package reference](https://pkg.go.dev/github.com/saschagrunert/security-
 Paths may use AppArmor glob syntax: `*` (any characters except `/`), `**`
 (any characters including `/`), `?` (one character except `/`), character
 classes such as `[abc]`, `[a-z]`, and `[^a]`, and alternations such as
-`{a,b}`, which may nest and may contain further glob tokens. A backslash
-escapes the following character. On intersection a literal path survives when
-a glob on the other side matches it, and two globs survive only when one is
-the other's `**` prefix expansion or they are identical. On union a glob prunes
-literals it matches. Patterns longer than 4096 bytes or with more than 100
-alternatives in total never match, so they are dropped on intersection and
-kept verbatim on union.
+`{a,b}`, which may nest and may contain further glob tokens. As in the
+AppArmor parser, `*` and `**` at the start of a path component match at least
+one character, so `/dir/**` does not match `/dir/` itself. A backslash escapes
+the following character, and an escaped literal such as `/etc/\*` is matched
+against globs as the file name `/etc/*`. Literal paths are cleaned but keep a
+trailing slash, which distinguishes a directory rule from a file rule. On
+intersection a literal path survives when a glob on the other side matches
+it, and two globs survive only when they are identical or one is the `**`
+expansion of a literal prefix containing the other's prefix (so `/etc/**`
+narrows to `/etc/*.conf` and to `/etc/foo/*.conf`). On union a glob prunes
+literals it matches; globs never prune other globs. Patterns longer than 4096
+bytes or with more than 100 alternatives in total never match, so they are
+dropped on intersection and kept verbatim on union.
 
 ### Nil vs empty semantics
 
@@ -203,7 +228,7 @@ import "github.com/saschagrunert/security-profiles-merger/landlock"
 |----------|-------------|
 | `Intersect` | Merge via intersection; handled sets unioned, rules intersected |
 | `Union` | Merge via union; handled sets intersected, rules unioned |
-| `Validate` | Check for known rights, empty paths, and duplicate rules |
+| `Validate` | Check for known rights, valid paths, and duplicate rules |
 | `ValidateStrict` | All Validate checks plus unhandled-right and relative path detection |
 | `FormatProfile` | Human-readable representation of a Landlock profile |
 | `Diff` | Structured diff between two profiles |
@@ -226,8 +251,8 @@ formatting.
 ### Errors
 
 Sentinel errors (`ErrNoProfiles`, `ErrNilProfile`, `ErrUnknownRight`,
-`ErrDuplicateRule`, `ErrEmptyPath`, `ErrUnhandledRight`, `ErrDuplicateRight`,
-`ErrRelativePath`, etc.) are documented in the
+`ErrDuplicateRule`, `ErrEmptyPath`, `ErrInvalidPath`, `ErrUnhandledRight`,
+`ErrDuplicateRight`, `ErrRelativePath`, etc.) are documented in the
 [package reference](https://pkg.go.dev/github.com/saschagrunert/security-profiles-merger/landlock#pkg-variables).
 
 ### Handled access semantics
@@ -254,3 +279,15 @@ nested rules accumulate, so a rule on `/etc` in one profile intersected with a
 rule on `/` in the other yields a rule on `/etc`. Network rules match by exact
 port. During union, access rights are combined for matching entries, and all
 non-matching entries are kept.
+
+Rights outside the merged handled sets are pruned from rules, and rules left
+without rights are dropped. Unhandled rights are implicitly allowed, so this
+does not change what the result permits, but the kernel rejects a rule whose
+rights are not a subset of the handled access set. Merge results therefore
+pass `ValidateStrict` when the inputs use absolute paths.
+
+Paths are cleaned before merging and before duplicate detection in
+`Validate`, so `/etc` and `/etc/` are the same rule. Empty paths, paths that
+clean to `.`, and paths containing NUL bytes are rejected. Intersect and Union
+deduplicate rules and rights within each input before validating it, so
+duplicates within one input are merged rather than rejected there.

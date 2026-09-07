@@ -242,6 +242,12 @@ func globToRegex(pattern string) *regexp.Regexp {
 	return compiled
 }
 
+// globNeverMatches reports whether a glob pattern exceeds the size limits
+// and therefore matches nothing.
+func globNeverMatches(pattern string) bool {
+	return globToRegex(pattern) == neverMatchRe
+}
+
 func compileGlob(pattern string) *regexp.Regexp {
 	if len(pattern) > maxGlobPatternLen {
 		return neverMatchRe
@@ -249,7 +255,7 @@ func compileGlob(pattern string) *regexp.Regexp {
 
 	budget := maxGlobAlternatives
 
-	fragment, ok := globFragment(pattern, &budget)
+	fragment, ok := globFragment(pattern, &budget, '/')
 	if !ok {
 		return neverMatchRe
 	}
@@ -263,14 +269,22 @@ func compileGlob(pattern string) *regexp.Regexp {
 }
 
 // globFragment translates a pattern into an unanchored regex fragment. The
-// budget bounds the total number of alternatives across nested groups.
-func globFragment(pattern string, budget *int) (string, bool) {
+// budget bounds the total number of alternatives across nested groups. prev
+// is the byte preceding the pattern in its enclosing context ('/' for a
+// whole path, '{' or ',' inside an alternation) and decides whether a
+// leading "*" or "**" starts a path component.
+func globFragment(pattern string, budget *int, prev byte) (string, bool) {
 	var builder strings.Builder
 
 	for pos := 0; pos < len(pattern); {
 		end, kind := scanToken(pattern, pos)
 
-		fragment, ok := tokenFragment(pattern[pos:end], kind, budget)
+		before := prev
+		if pos > 0 {
+			before = pattern[pos-1]
+		}
+
+		fragment, ok := tokenFragment(pattern[pos:end], kind, budget, before == '/')
 		if !ok {
 			return "", false
 		}
@@ -284,12 +298,24 @@ func globFragment(pattern string, budget *int) (string, bool) {
 }
 
 // tokenFragment translates one token into a regex fragment. Only an
-// alternation can fail, by exhausting the budget.
-func tokenFragment(token string, kind globToken, budget *int) (string, bool) {
+// alternation can fail, by exhausting the budget. As in the AppArmor parser,
+// "*" and "**" at the start of a path component match at least one
+// character, so "/dir/**" does not match "/dir/" itself.
+func tokenFragment(
+	token string, kind globToken, budget *int, componentStart bool,
+) (string, bool) {
 	switch kind {
 	case tokenDoubleStar:
+		if componentStart {
+			return `[^/\000][^\000]*`, true
+		}
+
 		return `[^\000]*`, true
 	case tokenStar:
+		if componentStart {
+			return `[^/\000][^/\000]*`, true
+		}
+
 		return `[^/\000]*`, true
 	case tokenQuestion:
 		return `[^/\000]`, true
@@ -323,7 +349,7 @@ func alternationFragment(token string, budget *int) (string, bool) {
 			builder.WriteByte('|')
 		}
 
-		fragment, ok := globFragment(alternative, budget)
+		fragment, ok := globFragment(alternative, budget, '{')
 		if !ok {
 			return "", false
 		}
@@ -345,6 +371,26 @@ func unescape(token string) string {
 	return token
 }
 
+// unescapeLiteral returns the file name denoted by a literal path, with
+// backslash escapes resolved, for matching against glob regexes.
+func unescapeLiteral(path string) string {
+	if !strings.Contains(path, `\`) {
+		return path
+	}
+
+	var builder strings.Builder
+
+	for pos := 0; pos < len(path); pos++ {
+		if path[pos] == '\\' && pos+1 < len(path) {
+			pos++
+		}
+
+		builder.WriteByte(path[pos])
+	}
+
+	return builder.String()
+}
+
 // classFragment translates a "[...]" token into a regex character class.
 // Ranges ("a-z") are kept; every other member is escaped.
 func classFragment(token string) string {
@@ -360,17 +406,19 @@ func classFragment(token string) string {
 		inner = inner[1:]
 	}
 
-	for idx := 0; idx < len(inner); idx++ {
-		if inner[idx] == '\\' && idx+1 < len(inner) {
+	members := []rune(inner)
+
+	for idx := 0; idx < len(members); idx++ {
+		if members[idx] == '\\' && idx+1 < len(members) {
 			idx++
 
 			// Quote rather than re-escape: "\d" must stay a literal "d".
-			builder.WriteString(regexp.QuoteMeta(string(inner[idx])))
+			builder.WriteString(regexp.QuoteMeta(string(members[idx])))
 
 			continue
 		}
 
-		builder.WriteString(classMember(inner, idx))
+		builder.WriteString(classMember(members, idx))
 	}
 
 	builder.WriteByte(']')
@@ -380,14 +428,14 @@ func classFragment(token string) string {
 
 // classMember renders the class member at idx, keeping "-" as a range
 // operator between two members and escaping regex metacharacters.
-func classMember(inner string, idx int) string {
-	char := inner[idx]
+func classMember(members []rune, idx int) string {
+	char := members[idx]
 
-	if char == '-' && idx > 0 && idx+1 < len(inner) {
+	if char == '-' && idx > 0 && idx+1 < len(members) {
 		return "-"
 	}
 
-	if strings.IndexByte(`\][^-`, char) >= 0 {
+	if strings.ContainsRune(`\][^-`, char) {
 		return `\` + string(char)
 	}
 
@@ -431,18 +479,35 @@ func newPathSet(patterns []string) pathSet {
 	return set
 }
 
+// matches reports whether a literal path is present or covered by a glob.
 func (set *pathSet) matches(path string) bool {
 	if _, ok := set.literals[path]; ok {
 		return true
 	}
 
+	name := unescapeLiteral(path)
+
 	for _, entry := range set.globs {
-		if entry.expr.MatchString(path) {
+		if entry.expr.MatchString(name) {
 			return true
 		}
 	}
 
 	return false
+}
+
+// covers reports whether the set already grants everything the path grants:
+// a literal is covered when present or matched by a glob, a glob only when
+// present verbatim, since matching a pattern string against another glob's
+// regex does not indicate language inclusion.
+func (set *pathSet) covers(path string) bool {
+	if IsGlobPattern(path) {
+		return slices.ContainsFunc(set.globs, func(existing apparmorPath) bool {
+			return existing.pattern == path
+		})
+	}
+
+	return set.matches(path)
 }
 
 func (set *pathSet) add(pattern string) {
@@ -459,7 +524,7 @@ func (set *pathSet) add(pattern string) {
 		// pattern string against another glob's regex does not
 		// reliably indicate language inclusion.
 		for lit := range set.literals {
-			if expr.MatchString(lit) {
+			if expr.MatchString(unescapeLiteral(lit)) {
 				delete(set.literals, lit)
 			}
 		}
@@ -496,7 +561,7 @@ func (set *pathSet) popCoveredLiterals(glob string) []string {
 	var popped []string
 
 	for lit := range set.literals {
-		if expr.MatchString(lit) {
+		if expr.MatchString(unescapeLiteral(lit)) {
 			popped = append(popped, lit)
 		}
 	}
@@ -551,12 +616,12 @@ func intersectPaths(left, right []string) []string {
 	addMatchedLiterals(right, &leftSet, addPath)
 
 	for _, leftPath := range left {
-		if !IsGlobPattern(leftPath) {
+		if !IsGlobPattern(leftPath) || globNeverMatches(leftPath) {
 			continue
 		}
 
 		for _, rightPath := range right {
-			if !IsGlobPattern(rightPath) {
+			if !IsGlobPattern(rightPath) || globNeverMatches(rightPath) {
 				continue
 			}
 
@@ -590,8 +655,14 @@ func buildFsEntries(perms map[string]fsPermission) []fsPathEntry {
 
 	for path, perm := range perms {
 		var expr *regexp.Regexp
+
 		if IsGlobPattern(path) {
 			expr = globToRegex(path)
+			if expr == neverMatchRe {
+				// An oversize pattern grants nothing, so it cannot
+				// contribute to an intersection.
+				continue
+			}
 		}
 
 		entries = append(entries, fsPathEntry{
@@ -615,11 +686,11 @@ func matchIntersectPaths(left, right fsPathEntry) string {
 
 	switch {
 	case left.expr == nil && right.expr != nil:
-		if right.expr.MatchString(left.path) {
+		if right.expr.MatchString(unescapeLiteral(left.path)) {
 			return left.path
 		}
 	case left.expr != nil && right.expr == nil:
-		if left.expr.MatchString(right.path) {
+		if left.expr.MatchString(unescapeLiteral(right.path)) {
 			return right.path
 		}
 	case left.expr != nil && right.expr != nil:
@@ -648,9 +719,11 @@ func globLiteralPrefix(pattern string) string {
 	return ""
 }
 
-// narrowGlobs returns the more specific glob when one glob's literal prefix
-// strictly contains the other's. Exact string matches are kept as-is.
-// If neither prefix contains the other, returns empty string.
+// narrowGlobs returns the more specific glob when the other one is the
+// "**" expansion of a literal prefix that contains the specific glob's
+// prefix, so that "/etc/**" narrows to "/etc/*.conf" as well as to
+// "/etc/foo/*.conf". Exact string matches are kept as-is. If neither glob
+// contains the other in this way, returns empty string.
 func narrowGlobs(left, right string) string {
 	if left == right {
 		return left
@@ -659,15 +732,12 @@ func narrowGlobs(left, right string) string {
 	leftPrefix := globLiteralPrefix(left)
 	rightPrefix := globLiteralPrefix(right)
 
-	switch {
-	case strings.HasPrefix(rightPrefix, leftPrefix) && leftPrefix != rightPrefix:
-		if left == leftPrefix+"**" {
-			return right
-		}
-	case strings.HasPrefix(leftPrefix, rightPrefix) && rightPrefix != leftPrefix:
-		if right == rightPrefix+"**" {
-			return left
-		}
+	if left == leftPrefix+"**" && strings.HasPrefix(rightPrefix, leftPrefix) {
+		return right
+	}
+
+	if right == rightPrefix+"**" && strings.HasPrefix(leftPrefix, rightPrefix) {
+		return left
 	}
 
 	return ""

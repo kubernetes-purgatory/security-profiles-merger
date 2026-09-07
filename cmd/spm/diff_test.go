@@ -360,3 +360,22 @@ func TestDiffLandlockHuman(t *testing.T) {
 		t.Errorf("expected Diff{...} output, got: %s", stdout)
 	}
 }
+
+func TestDiffStdinArrayWithFileRequiresTwoProfiles(t *testing.T) {
+	t.Parallel()
+
+	fileA := writeTemp(t, seccompJSON(t, testSyscallRead))
+	stdin := strings.NewReader("[" + seccompJSON(t, "write") + "," + seccompJSON(t, "open") + "]")
+
+	code, _, stderr := runCapture(t, []string{
+		cmdDiff, flagType, typeSeccomp, fileA, "-",
+	}, stdin)
+
+	if code != exitUsage {
+		t.Fatalf("exit code = %d, want %d", code, exitUsage)
+	}
+
+	if !strings.Contains(stderr, "got 3 profiles") {
+		t.Errorf("expected profile count error, got: %s", stderr)
+	}
+}

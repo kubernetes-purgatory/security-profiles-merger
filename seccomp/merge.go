@@ -48,9 +48,16 @@ var (
 // affected calls fall back to the more restrictive surrounding action. The
 // result therefore never permits more than any input.
 //
-// Within a single profile, conditional entries take precedence over an
-// unconditional entry for the same syscall, and among matching conditional
-// entries the least restrictive action applies.
+// Within a single profile, entries are evaluated the way runc and libseccomp
+// load them: entries equal to the profile default are ignored, an
+// unconditional entry applies to every call of its syscall and overrides
+// conditional entries for the same syscall (the first unconditional entry
+// wins), and otherwise the least restrictive action among matching
+// conditional entries applies. Several conditions on the same argument index
+// within one entry are alternatives, as runc loads them. The result never
+// carries an unconditional entry next to conditional entries for the same
+// syscall; where that would be needed, a single filter is rewritten with its
+// complement and anything else collapses to the more restrictive action.
 //
 // ListenerPath and ListenerMetadata are taken from the first profile.
 // When two profiles share the same default or syscall action, DefaultErrnoRet
@@ -188,8 +195,7 @@ func intersectWithEmpty[T comparable](left, right []T) []T {
 
 // regroupSyscalls drops entries without names, merges entries sharing the
 // same action, errno, and argument filters into one multi-name entry, and
-// sorts the result by first name. Entries for the same name are ordered
-// unconditional first, then by argument filter.
+// sorts the result by first name, then by argument filter.
 func regroupSyscalls(syscalls []specs.LinuxSyscall) []specs.LinuxSyscall {
 	type group struct {
 		entry specs.LinuxSyscall

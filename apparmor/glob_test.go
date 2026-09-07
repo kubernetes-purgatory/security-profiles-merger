@@ -91,10 +91,10 @@ func TestUnionGlobStar(t *testing.T) {
 			want:  []string{globUsrLib},
 		},
 		{
-			name:  "double star does not subsume normalized directory",
+			name:  "double star does not subsume directory itself",
 			left:  []string{globUsrLib},
 			right: []string{"/usr/lib/"},
-			want:  []string{"/usr/lib", globUsrLib},
+			want:  []string{"/usr/lib/", globUsrLib},
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -750,9 +750,15 @@ func TestIntersectGlobStar(t *testing.T) {
 			want:  []string{globBinStar},
 		},
 		{
-			name:  "different globs conservative",
+			name:  "double star narrows to single star",
 			left:  []string{globUsrLib},
 			right: []string{globUsrLibStar},
+			want:  []string{globUsrLibStar},
+		},
+		{
+			name:  "unrelated globs with same prefix conservative",
+			left:  []string{"/usr/lib/*.so"},
+			right: []string{"/usr/lib/lib*"},
 			want:  nil,
 		},
 	} {
@@ -1146,10 +1152,10 @@ func TestIntersectGlobPrefixNarrowing(t *testing.T) {
 			want:  nil,
 		},
 		{
-			name:  "same prefix different suffix conservative",
+			name:  "same prefix narrows to more specific glob",
 			left:  []string{"/usr/lib/**"},
-			right: []string{"/usr/lib/*"},
-			want:  nil,
+			right: []string{"/usr/lib/*.so"},
+			want:  []string{"/usr/lib/*.so"},
 		},
 		{
 			name:  "three level narrowing",

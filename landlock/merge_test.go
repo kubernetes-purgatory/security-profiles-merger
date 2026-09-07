@@ -558,6 +558,8 @@ func TestUnionOverlappingPathRules(t *testing.T) {
 func TestUnionDisjointPathRules(t *testing.T) {
 	t.Parallel()
 
+	// Each side handles only the right it grants. The union handles neither,
+	// so both rights become implicitly allowed and no rule is needed.
 	left := &landlock.Profile{
 		HandledAccessFS: []landlock.FSAccessRight{
 			landlock.FSAccessReadFile,
@@ -593,11 +595,22 @@ func TestUnionDisjointPathRules(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
+	if len(result.HandledAccessFS) != 0 || len(result.PathRules) != 0 {
+		t.Fatalf("expected no handled rights and no rules, got %s", landlock.FormatProfile(result))
+	}
+
+	// When both sides handle both rights, the disjoint rules are kept.
+	both := []landlock.FSAccessRight{landlock.FSAccessReadFile, landlock.FSAccessWriteFile}
+	left.HandledAccessFS = both
+	right.HandledAccessFS = both
+
+	result, err = landlock.Union(left, right)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
 	if len(result.PathRules) != 2 {
-		t.Fatalf(
-			"expected 2 path rules (all kept), got %d",
-			len(result.PathRules),
-		)
+		t.Fatalf("expected 2 path rules (all kept), got %s", landlock.FormatProfile(result))
 	}
 }
 
