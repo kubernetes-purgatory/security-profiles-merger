@@ -876,9 +876,9 @@ func TestNormalizeDuplicateSyscalls(t *testing.T) {
 	t.Run("intersect", func(t *testing.T) {
 		t.Parallel()
 
-		// Left has read as both Allow and Log. Normalization picks the
-		// most permissive action to capture the permission envelope,
-		// so left's effective action for read is Allow.
+		// Left has read as both Allow and Log. Runtimes keep the first
+		// unconditional entry and drop later ones, so left's effective
+		// action for read is Allow.
 		left := &specs.LinuxSeccomp{
 			DefaultAction: specs.ActErrno,
 			Syscalls: []specs.LinuxSyscall{
@@ -905,6 +905,8 @@ func TestNormalizeDuplicateSyscalls(t *testing.T) {
 	t.Run("union", func(t *testing.T) {
 		t.Parallel()
 
+		// The first unconditional entry wins, so left's effective action
+		// for read is Log and the later Allow entry is ignored.
 		left := &specs.LinuxSeccomp{
 			DefaultAction: specs.ActErrno,
 			Syscalls: []specs.LinuxSyscall{
@@ -925,7 +927,7 @@ func TestNormalizeDuplicateSyscalls(t *testing.T) {
 			t.Fatalf("unexpected error: %v", err)
 		}
 
-		assertSyscallAction(t, result, syscallRead, specs.ActAllow)
+		assertSyscallAction(t, result, syscallRead, specs.ActLog)
 	})
 }
 
@@ -1560,25 +1562,36 @@ func TestIntersectArgsSameIndexDifferentOrder(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
+	assertSameIndexAlternatives(t, result, 2)
+}
+
+// assertSameIndexAlternatives checks that a syscall entry with several
+// conditions on the same argument index was expanded into one single-condition
+// Allow entry per condition, as runc loads such entries.
+func assertSameIndexAlternatives(t *testing.T, result *specs.LinuxSeccomp, want int) {
+	t.Helper()
+
+	var entries int
+
 	for _, syscall := range result.Syscalls {
-		if slices.Contains(syscall.Names, syscallClone) {
-			if syscall.Action != specs.ActAllow {
-				t.Errorf(
-					"clone action = %q, want %q (same args in different order)",
-					syscall.Action,
-					specs.ActAllow,
-				)
-			}
+		if !slices.Contains(syscall.Names, syscallClone) {
+			continue
+		}
 
-			if len(syscall.Args) != 2 {
-				t.Errorf("clone args count = %d, want 2", len(syscall.Args))
-			}
+		entries++
 
-			return
+		if syscall.Action != specs.ActAllow {
+			t.Errorf("clone action = %q, want %q", syscall.Action, specs.ActAllow)
+		}
+
+		if len(syscall.Args) != 1 {
+			t.Errorf("clone args count = %d, want 1", len(syscall.Args))
 		}
 	}
 
-	t.Error("clone not found in result")
+	if entries != want {
+		t.Errorf("clone entries = %d, want %d in %s", entries, want, seccomp.FormatProfile(result))
+	}
 }
 
 func TestIntersectArgsSameIndexReorderedFields(t *testing.T) {
@@ -1646,21 +1659,7 @@ func assertReorderedArgsAllowed(
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	for _, syscall := range result.Syscalls {
-		if slices.Contains(syscall.Names, syscallClone) {
-			if syscall.Action != specs.ActAllow {
-				t.Errorf("clone action = %q, want %q", syscall.Action, specs.ActAllow)
-			}
-
-			if len(syscall.Args) != len(leftArgs) {
-				t.Errorf("clone args count = %d, want %d", len(syscall.Args), len(leftArgs))
-			}
-
-			return
-		}
-	}
-
-	t.Error("clone not found in result")
+	assertSameIndexAlternatives(t, result, len(leftArgs))
 }
 
 func TestUnionSyscallsDifferent(t *testing.T) {
@@ -2569,7 +2568,7 @@ func TestIntersectUnconditionalDenyBeatsConditionalAllow(t *testing.T) {
 	}
 }
 
-func TestIntersectSelfPreservesConditionalOverride(t *testing.T) {
+func TestIntersectSelfUnconditionalOverridesConditional(t *testing.T) {
 	t.Parallel()
 
 	profile := &specs.LinuxSeccomp{
@@ -2589,7 +2588,9 @@ func TestIntersectSelfPreservesConditionalOverride(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	want := "Profile{default:SCMP_ACT_ALLOW socket->SCMP_ACT_ERRNO socket([0]SCMP_CMP_EQ:2)->SCMP_ACT_ALLOW}"
+	// libseccomp drops the conditional entry once an unconditional entry
+	// exists for the syscall, so the profile denies socket entirely.
+	want := "Profile{default:SCMP_ACT_ALLOW socket->SCMP_ACT_ERRNO}"
 	if got := seccomp.FormatProfile(result); got != want {
 		t.Errorf("Intersect(p, p) = %s, want %s", got, want)
 	}

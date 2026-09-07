@@ -226,6 +226,7 @@ func ExampleUnion() {
 	recording1 := &landlock.Profile{
 		HandledAccessFS: []landlock.FSAccessRight{
 			landlock.FSAccessReadFile,
+			landlock.FSAccessWriteFile,
 		},
 		HandledAccessNet: nil,
 		Scoped:           nil,
@@ -266,7 +267,7 @@ func ExampleUnion() {
 	}
 
 	// Output:
-	// HandledAccessFS: [read_file]
+	// HandledAccessFS: [read_file write_file]
 	// Path: /etc -> [read_file]
 	// Path: /home -> [write_file]
 }

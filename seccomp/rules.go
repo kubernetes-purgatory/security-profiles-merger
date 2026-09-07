@@ -29,15 +29,19 @@ import (
 // clause is a single rule for one syscall: an action, an optional errno, and
 // optional argument filters. A clause without args is unconditional.
 //
-// The evaluation model for one syscall within a profile is:
-//   - if any conditional clause matches the call, the least restrictive
-//     action among the matching conditional clauses applies;
-//   - otherwise the unconditional clause applies if present;
+// The evaluation model for one syscall within a profile mirrors how runc and
+// libseccomp load a profile:
+//   - entries whose action and errno equal the profile default are skipped;
+//   - an unconditional entry applies to every call of the syscall and takes
+//     precedence over conditional entries, which libseccomp drops; when
+//     several unconditional entries exist, the first one wins;
+//   - otherwise, if any conditional clause matches the call, the least
+//     restrictive action among the matching conditional clauses applies;
 //   - otherwise the profile default applies.
 //
-// Conditional clauses therefore take precedence over an unconditional clause
-// for the same syscall. Duplicate unconditional clauses resolve to the least
-// restrictive action.
+// An entry with several conditions on the same argument index is loaded by
+// runc as one rule per condition, so it is modeled as one clause per
+// condition (an OR) rather than a single conjoined filter.
 type clause struct {
 	action   specs.LinuxSeccompAction
 	errnoRet *uint
@@ -47,10 +51,14 @@ type clause struct {
 func (c clause) unconditional() bool { return len(c.args) == 0 }
 
 // sameResult reports whether two clauses yield the same runtime effect,
-// ignoring their argument filters.
+// ignoring their argument filters. ErrnoRet only matters for actions that
+// return it to the caller.
 func (c clause) sameResult(other clause) bool {
-	return actionsEquivalent(c.action, other.action) &&
-		equalUintPtr(c.errnoRet, other.errnoRet)
+	if !actionsEquivalent(c.action, other.action) {
+		return false
+	}
+
+	return !errnoSignificant(c.action) || equalUintPtr(c.errnoRet, other.errnoRet)
 }
 
 // pickClause selects between two clauses using the given action preference.
@@ -81,43 +89,102 @@ type syscallRules struct {
 }
 
 // collectRules splits syscall entries into per-name clause sets. Multi-name
-// entries contribute one clause per name. Duplicate unconditional entries
-// resolve to the least restrictive action.
-func collectRules(syscalls []specs.LinuxSyscall) map[string]*syscallRules {
+// entries contribute one clause per name. Entries equal to the profile
+// default are skipped when def is non-nil, the first unconditional entry wins
+// over later ones, and conditional entries are dropped for names that carry
+// an unconditional entry.
+func collectRules(syscalls []specs.LinuxSyscall, def *clause) map[string]*syscallRules {
 	rules := make(map[string]*syscallRules)
 
 	for idx := range syscalls {
 		entry := &syscalls[idx]
 
-		for _, name := range entry.Names {
-			current, ok := rules[name]
-			if !ok {
-				current = &syscallRules{unconditional: nil, conditional: nil}
-				rules[name] = current
-			}
-
-			next := clause{
-				action:   entry.Action,
-				errnoRet: merge.ClonePtr(entry.ErrnoRet),
-				args:     sortedArgs(entry.Args),
-			}
-
-			if !next.unconditional() {
-				current.conditional = append(current.conditional, next)
-
+		for _, next := range entryClauses(entry) {
+			if def != nil && next.sameResult(*def) {
 				continue
 			}
 
-			if current.unconditional == nil {
-				current.unconditional = &next
-			} else {
-				picked := lessRestrictiveClause(*current.unconditional, next)
-				current.unconditional = &picked
+			for _, name := range entry.Names {
+				current, ok := rules[name]
+				if !ok {
+					current = &syscallRules{unconditional: nil, conditional: nil}
+					rules[name] = current
+				}
+
+				current.add(next)
 			}
 		}
 	}
 
+	for _, current := range rules {
+		if current.unconditional != nil {
+			current.conditional = nil
+		}
+	}
+
 	return rules
+}
+
+// entryClauses expands one syscall entry into clauses. An entry whose args
+// repeat an argument index yields one single-condition clause per arg, as
+// runc loads such entries; every other entry yields exactly one clause.
+func entryClauses(entry *specs.LinuxSyscall) []clause {
+	base := clause{
+		action:   entry.Action,
+		errnoRet: merge.ClonePtr(entry.ErrnoRet),
+		args:     nil,
+	}
+
+	if !hasRepeatedIndex(entry.Args) {
+		base.args = sortedArgs(entry.Args)
+
+		return []clause{base}
+	}
+
+	clauses := make([]clause, 0, len(entry.Args))
+
+	for _, arg := range entry.Args {
+		next := base
+		next.errnoRet = merge.ClonePtr(entry.ErrnoRet)
+		next.args = []specs.LinuxSeccompArg{arg}
+		clauses = append(clauses, next)
+	}
+
+	return clauses
+}
+
+func hasRepeatedIndex(args []specs.LinuxSeccompArg) bool {
+	var seen [maxSyscallArgIndex + 1]bool
+
+	for _, arg := range args {
+		if arg.Index > maxSyscallArgIndex {
+			continue
+		}
+
+		if seen[arg.Index] {
+			return true
+		}
+
+		seen[arg.Index] = true
+	}
+
+	return false
+}
+
+// add records a clause. The first unconditional clause wins; conditional
+// clauses accumulate.
+func (r *syscallRules) add(next clause) {
+	next.errnoRet = merge.ClonePtr(next.errnoRet)
+
+	if !next.unconditional() {
+		r.conditional = append(r.conditional, next)
+
+		return
+	}
+
+	if r.unconditional == nil {
+		r.unconditional = &next
+	}
 }
 
 // fallback returns the clause applied when no conditional clause matches:
@@ -173,7 +240,9 @@ func (m ruleMerger) pickClause(left, right clause) clause {
 //
 // leftDef and rightDef are the profile defaults, or nil for bare syscall
 // lists. The returned fallback is the unconditional clause of the result, or
-// nil when only the caller's default applies.
+// nil when only the caller's default applies. The conditional clauses are
+// not yet collapsed: callers run finishRules with the effective fallback,
+// which is the merged default where the fallback is elided.
 func (m ruleMerger) mergeRules(
 	left, right *syscallRules,
 	leftDef, rightDef *clause,
@@ -205,7 +274,128 @@ func (m ruleMerger) mergeRules(
 		}
 	}
 
-	return fallback, collapseClauses(conditional, fallback)
+	return fallback, conditional
+}
+
+// resolveMixed makes a merged rule set expressible: an unconditional entry
+// would override every conditional entry of the same syscall at load time,
+// so a non-nil fallback must not be emitted next to conditional clauses.
+// A single one-condition clause is rewritten as the clause plus its
+// complement carrying the fallback, which is exact. Otherwise the whole
+// syscall collapses to one unconditional clause combining the fallback and
+// every conditional action with the merge direction's preference, which is
+// conservative in the safe direction.
+func (m ruleMerger) resolveMixed(fallback *clause, conditional []clause) (*clause, []clause) {
+	if fallback == nil || len(conditional) == 0 {
+		return fallback, conditional
+	}
+
+	conditional = m.foldIntoFallback(fallback, conditional)
+	if len(conditional) == 0 {
+		return fallback, nil
+	}
+
+	if len(conditional) == 1 && len(conditional[0].args) == 1 {
+		if complement, ok := complementArg(conditional[0].args[0]); ok {
+			rest := clause{
+				action:   fallback.action,
+				errnoRet: merge.ClonePtr(fallback.errnoRet),
+				args:     []specs.LinuxSeccompArg{complement},
+			}
+
+			return nil, sortClauses([]clause{conditional[0], rest})
+		}
+	}
+
+	collapsed := *fallback
+
+	for _, current := range conditional {
+		collapsed = m.pickClause(collapsed, current)
+	}
+
+	collapsed.args = nil
+
+	return &collapsed, nil
+}
+
+// foldIntoFallback drops conditional clauses that differ from the fallback
+// only by errno. The rewrite in resolveMixed cannot keep their errno, and
+// folding them first lets a single remaining filter use the exact complement
+// form instead of collapsing the whole syscall. For union, a stricter clause
+// overlapping a folded clause is raised to the fallback first, because the
+// folded clause no longer shields the overlap.
+func (m ruleMerger) foldIntoFallback(fallback *clause, conditional []clause) []clause {
+	byArgs := make(map[string]clause, len(conditional))
+	order := make([]string, 0, len(conditional))
+
+	for _, current := range conditional {
+		key := argsKey(current.args)
+
+		if existing, ok := byArgs[key]; ok {
+			byArgs[key] = lessRestrictiveClause(existing, current)
+
+			continue
+		}
+
+		byArgs[key] = current
+		order = append(order, key)
+	}
+
+	if !m.intersect {
+		raiseOverlapsOfRedundant(byArgs, func(current clause) bool {
+			return actionsEquivalent(current.action, fallback.action)
+		})
+	}
+
+	kept := make([]clause, 0, len(conditional))
+
+	for _, key := range order {
+		current := byArgs[key]
+		if actionsEquivalent(current.action, fallback.action) {
+			continue
+		}
+
+		kept = append(kept, current)
+	}
+
+	return kept
+}
+
+// complementArg returns the condition matching exactly the values the given
+// condition does not match. Masked comparisons have no complement.
+func complementArg(arg specs.LinuxSeccompArg) (specs.LinuxSeccompArg, bool) {
+	complement, ok := complementOps[arg.Op]
+	if !ok {
+		return specs.LinuxSeccompArg{}, false
+	}
+
+	return specs.LinuxSeccompArg{
+		Index:    arg.Index,
+		Value:    arg.Value,
+		ValueTwo: 0,
+		Op:       complement,
+	}, true
+}
+
+// complementOps maps each comparison operator to the one matching exactly
+// the remaining values. Masked comparisons have no complement.
+//
+//nolint:gochecknoglobals // immutable lookup table
+var complementOps = map[specs.LinuxSeccompOperator]specs.LinuxSeccompOperator{
+	specs.OpEqualTo:      specs.OpNotEqual,
+	specs.OpNotEqual:     specs.OpEqualTo,
+	specs.OpLessThan:     specs.OpGreaterEqual,
+	specs.OpGreaterEqual: specs.OpLessThan,
+	specs.OpLessEqual:    specs.OpGreaterThan,
+	specs.OpGreaterThan:  specs.OpLessEqual,
+}
+
+func sortClauses(clauses []clause) []clause {
+	slices.SortFunc(clauses, func(a, b clause) int {
+		return cmp.Compare(argsKey(a.args), argsKey(b.args))
+	})
+
+	return clauses
 }
 
 // mergeFallback combines the fallback clauses of both sides. Intersection
@@ -312,10 +502,10 @@ func conjoinClauseArgs(
 
 // collapseClauses merges clauses with identical argument filters (keeping the
 // least restrictive, since they always match together) and drops clauses
-// that yield the same result as the fallback. A clause equal to the fallback
-// is still kept when a stricter clause may overlap it: removing it would let
-// the stricter clause win where both matched.
-func collapseClauses(clauses []clause, fallback *clause) []clause {
+// that yield the same result as the fallback. Runtimes skip such entries at
+// load time, so they cannot shield a call from a stricter overlapping clause;
+// for union the stricter clause is raised to the fallback instead.
+func (m ruleMerger) collapseClauses(clauses []clause, fallback *clause) []clause {
 	byArgs := make(map[string]clause, len(clauses))
 	order := make([]string, 0, len(clauses))
 
@@ -333,40 +523,61 @@ func collapseClauses(clauses []clause, fallback *clause) []clause {
 		byArgs[key] = lessRestrictiveClause(existing, current)
 	}
 
+	if fallback != nil && !m.intersect {
+		raiseOverlapsOfRedundant(byArgs, func(current clause) bool {
+			return current.sameResult(*fallback)
+		})
+	}
+
 	result := make([]clause, 0, len(order))
 
 	for _, key := range order {
 		current := byArgs[key]
-		if fallback != nil && current.sameResult(*fallback) &&
-			!overlapsStricter(current, key, byArgs) {
+		if fallback != nil && current.sameResult(*fallback) {
 			continue
 		}
 
 		result = append(result, current)
 	}
 
-	slices.SortFunc(result, func(a, b clause) int {
-		return cmp.Compare(argsKey(a.args), argsKey(b.args))
-	})
-
-	return result
+	return sortClauses(result)
 }
 
-// overlapsStricter reports whether any other clause may match a call that
-// current matches while applying a strictly more restrictive action.
-func overlapsStricter(current clause, key string, byArgs map[string]clause) bool {
-	for otherKey, other := range byArgs {
-		if otherKey == key || argsDisjoint(current.args, other.args) {
-			continue
-		}
+// raiseOverlapsOfRedundant raises every clause that is stricter than a
+// redundant clause and may match a call the redundant clause also matches.
+// Redundant clauses are dropped from the result, or skipped by runtimes when
+// they equal the default, so without this the stricter clause would win
+// where both match and the union could deny a call an input permits. Raising
+// propagates until no such pair remains.
+func raiseOverlapsOfRedundant(byArgs map[string]clause, redundant func(clause) bool) {
+	for changed := true; changed; {
+		changed = false
 
-		if !actionsEquivalent(other.action, current.action) &&
-			actionsEquivalent(MoreRestrictive(other.action, current.action), other.action) {
-			return true
+		for key, current := range byArgs {
+			if !redundant(current) {
+				continue
+			}
+
+			for otherKey, other := range byArgs {
+				if otherKey == key || argsDisjoint(current.args, other.args) ||
+					!stricter(other, current) {
+					continue
+				}
+
+				raised := current
+				raised.args = other.args
+				byArgs[otherKey] = raised
+				changed = true
+			}
 		}
 	}
+}
 
-	return false
+// stricter reports whether the first clause applies a strictly more
+// restrictive action than the second.
+func stricter(first, second clause) bool {
+	return !actionsEquivalent(first.action, second.action) &&
+		actionsEquivalent(MoreRestrictive(first.action, second.action), first.action)
 }
 
 func defaultClause(profile *specs.LinuxSeccomp) *clause {
@@ -383,10 +594,10 @@ func (m ruleMerger) mergeProfileSyscalls(
 	left, right *specs.LinuxSeccomp,
 	mergedDefault *clause,
 ) []specs.LinuxSyscall {
-	leftRules := collectRules(left.Syscalls)
-	rightRules := collectRules(right.Syscalls)
 	leftDef := defaultClause(left)
 	rightDef := defaultClause(right)
+	leftRules := collectRules(left.Syscalls, leftDef)
+	rightRules := collectRules(right.Syscalls, rightDef)
 
 	names := slices.Sorted(maps.Keys(leftRules))
 
@@ -404,6 +615,7 @@ func (m ruleMerger) mergeProfileSyscalls(
 		fallback, conditional := m.mergeRules(
 			leftRules[name], rightRules[name], leftDef, rightDef,
 		)
+		fallback, conditional = m.finishRules(mergedDefault, fallback, conditional)
 
 		if fallback != nil && !fallback.sameResult(*mergedDefault) {
 			result = append(result, clauseToSyscall(name, *fallback))
@@ -417,12 +629,44 @@ func (m ruleMerger) mergeProfileSyscalls(
 	return result
 }
 
+// finishRules turns merged rules into emittable ones. A fallback equal to
+// the merged default is elided, and conditional clauses are collapsed
+// against whatever applies where they do not match: the fallback, or the
+// merged default once the fallback is elided. A fallback that differs from
+// the default only by errno is elided as well when a conditional clause with
+// a different action remains, since keeping that clause is worth more than
+// the errno value: an unconditional entry would force it to collapse.
+// Clauses that share the fallback's action fold into it instead, so the
+// leftmost errno survives.
+func (m ruleMerger) finishRules(
+	mergedDefault, fallback *clause, conditional []clause,
+) (*clause, []clause) {
+	switch {
+	case fallback == nil || fallback.sameResult(*mergedDefault):
+		fallback = nil
+		conditional = m.collapseClauses(conditional, mergedDefault)
+	case actionsEquivalent(fallback.action, mergedDefault.action):
+		conditional = m.collapseClauses(conditional, fallback)
+
+		if slices.ContainsFunc(conditional, func(current clause) bool {
+			return !actionsEquivalent(current.action, fallback.action)
+		}) {
+			conditional = m.collapseClauses(conditional, mergedDefault)
+			fallback = nil
+		}
+	default:
+		conditional = m.collapseClauses(conditional, fallback)
+	}
+
+	return m.resolveMixed(fallback, conditional)
+}
+
 // mergeBareSyscalls merges two syscall lists that carry no profile default.
 // Names present on one side only are dropped for intersection and kept for
 // union.
 func (m ruleMerger) mergeBareSyscalls(left, right []specs.LinuxSyscall) []specs.LinuxSyscall {
-	leftRules := collectRules(left)
-	rightRules := collectRules(right)
+	leftRules := collectRules(left, nil)
+	rightRules := collectRules(right, nil)
 
 	names := slices.Sorted(maps.Keys(leftRules))
 
@@ -445,6 +689,8 @@ func (m ruleMerger) mergeBareSyscalls(left, right []specs.LinuxSyscall) []specs.
 		}
 
 		fallback, conditional := m.mergeRules(leftRule, rightRule, nil, nil)
+		fallback, conditional = m.resolveMixed(fallback, m.collapseClauses(conditional, fallback))
+
 		if fallback != nil {
 			result = append(result, clauseToSyscall(name, *fallback))
 		}

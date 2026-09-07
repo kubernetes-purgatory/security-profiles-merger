@@ -17,8 +17,6 @@ limitations under the License.
 package seccomp_test
 
 import (
-	"cmp"
-	"fmt"
 	"slices"
 	"testing"
 
@@ -355,42 +353,9 @@ func sameRestrictiveness(
 		seccomp.MoreRestrictive(actionB, actionA) == actionB
 }
 
-// filterRedundantSyscalls drops entries that are no-ops under the evaluation
-// model: unconditional entries equal to the default, and conditional entries
-// equal to their syscall's fallback (its unconditional entry, or else the
-// default). The fuzz generator never emits overlapping conditional entries
-// for one syscall, so no stricter clause can shadow a dropped one. Entries
-// must already be expanded to one name each.
-func filterRedundantSyscalls(
-	syscalls []specs.LinuxSyscall,
-	defaultAction specs.LinuxSeccompAction,
-) []specs.LinuxSyscall {
-	fallback := make(map[string]specs.LinuxSeccompAction)
-
-	for _, syscall := range syscalls {
-		if len(syscall.Args) == 0 {
-			fallback[syscall.Names[0]] = syscall.Action
-		}
-	}
-
-	result := make([]specs.LinuxSyscall, 0, len(syscalls))
-
-	for _, syscall := range syscalls {
-		reference := defaultAction
-		if action, ok := fallback[syscall.Names[0]]; ok && len(syscall.Args) > 0 {
-			reference = action
-		}
-
-		if sameRestrictiveness(syscall.Action, reference) {
-			continue
-		}
-
-		result = append(result, syscall)
-	}
-
-	return result
-}
-
+// equalModuloErrnoRet reports whether two profiles apply actions of the same
+// restrictiveness to every sampled call, ignoring errno values and the
+// structure of the syscall entries.
 func equalModuloErrnoRet(
 	first, second *specs.LinuxSeccomp,
 ) bool {
@@ -418,103 +383,38 @@ func equalModuloErrnoRet(
 		return false
 	}
 
-	firstSyscalls := filterRedundantSyscalls(
-		expandSyscallNames(first.Syscalls),
-		first.DefaultAction,
-	)
-	secondSyscalls := filterRedundantSyscalls(
-		expandSyscallNames(second.Syscalls),
-		second.DefaultAction,
-	)
+	names := syscallNames(first, second)
+	values := sampleValues(first, second)
 
-	if len(firstSyscalls) != len(secondSyscalls) {
-		return false
-	}
-
-	sortSyscallsByName(firstSyscalls)
-	sortSyscallsByName(secondSyscalls)
-
-	for idx := range firstSyscalls {
-		if firstSyscalls[idx].Names[0] != secondSyscalls[idx].Names[0] {
-			return false
-		}
-
-		if !sameRestrictiveness(firstSyscalls[idx].Action, secondSyscalls[idx].Action) {
-			return false
-		}
-
-		if !equalArgsSorted(firstSyscalls[idx].Args, secondSyscalls[idx].Args) {
-			return false
+	for _, name := range names {
+		for _, arg0 := range values {
+			for _, arg1 := range values {
+				call := []uint64{arg0, arg1}
+				if !sameRestrictiveness(evalCall(first, name, call), evalCall(second, name, call)) {
+					return false
+				}
+			}
 		}
 	}
 
 	return true
 }
 
-// expandSyscallNames splits grouped multi-name entries into one entry per
-// name so profiles can be compared regardless of grouping.
-func expandSyscallNames(syscalls []specs.LinuxSyscall) []specs.LinuxSyscall {
-	result := make([]specs.LinuxSyscall, 0, len(syscalls))
+// syscallNames returns every syscall name mentioned by the profiles.
+func syscallNames(profiles ...*specs.LinuxSeccomp) []string {
+	var names []string
 
-	for _, syscall := range syscalls {
-		for _, name := range syscall.Names {
-			result = append(result, specs.LinuxSyscall{
-				Names:    []string{name},
-				Action:   syscall.Action,
-				ErrnoRet: syscall.ErrnoRet,
-				Args:     syscall.Args,
-			})
+	for _, profile := range profiles {
+		for _, syscall := range profile.Syscalls {
+			for _, name := range syscall.Names {
+				if !slices.Contains(names, name) {
+					names = append(names, name)
+				}
+			}
 		}
 	}
 
-	return result
-}
-
-func sortSyscallsByName(syscalls []specs.LinuxSyscall) {
-	slices.SortFunc(syscalls, func(left, right specs.LinuxSyscall) int {
-		if result := cmp.Compare(left.Names[0], right.Names[0]); result != 0 {
-			return result
-		}
-
-		return cmp.Compare(formatSortedArgs(left.Args), formatSortedArgs(right.Args))
-	})
-}
-
-func formatSortedArgs(args []specs.LinuxSeccompArg) string {
-	sorted := slices.Clone(args)
-	sortArgsByValue(sorted)
-
-	return fmt.Sprint(sorted)
-}
-
-func equalArgsSorted(
-	first, second []specs.LinuxSeccompArg,
-) bool {
-	firstClone := slices.Clone(first)
-	secondClone := slices.Clone(second)
-
-	sortArgsByValue(firstClone)
-	sortArgsByValue(secondClone)
-
-	return slices.Equal(firstClone, secondClone)
-}
-
-func sortArgsByValue(args []specs.LinuxSeccompArg) {
-	slices.SortFunc(args, func(left, right specs.LinuxSeccompArg) int {
-		if result := cmp.Compare(left.Index, right.Index); result != 0 {
-			return result
-		}
-
-		if result := cmp.Compare(left.Value, right.Value); result != 0 {
-			return result
-		}
-
-		if result := cmp.Compare(left.ValueTwo, right.ValueTwo); result != 0 {
-			return result
-		}
-
-		return cmp.Compare(left.Op, right.Op)
-	})
+	return names
 }
 
 func FuzzIntersect(f *testing.F) {

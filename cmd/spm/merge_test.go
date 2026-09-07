@@ -435,7 +435,7 @@ func TestMergeLandlockUnionFiles(t *testing.T) {
 	t.Parallel()
 
 	p1 := writeTemp(t, landlockJSON(t, "read_file"))
-	p2 := writeTemp(t, landlockJSON(t, "write_file"))
+	p2 := writeTemp(t, landlockJSON(t, "read_file", "write_file"))
 
 	code, stdout, _ := runCapture(t, []string{
 		cmdMerge, flagType, typeLandlock, flagStrategy, strategyUnion, p1, p2,

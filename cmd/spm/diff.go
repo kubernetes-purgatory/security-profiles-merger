@@ -121,7 +121,20 @@ func readDiffInputs(
 		)
 	}
 
-	return readInputs(paths, stdin)
+	data, err := readInputs(paths, stdin)
+	if err != nil {
+		return nil, err
+	}
+
+	// A "-" argument may expand to several profiles when stdin holds a
+	// JSON array.
+	if len(data) != diffProfileCount {
+		return nil, fmt.Errorf(
+			"got %d profiles: %w", len(data), errDiffRequiresTwo,
+		)
+	}
+
+	return data, nil
 }
 
 type equalChecker interface {

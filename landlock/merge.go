@@ -56,6 +56,11 @@ func Intersect(profiles ...*Profile) (*Profile, error) {
 // less restrictive, because unhandled rights are implicitly allowed). Path and
 // network rules for entries present in both profiles have their access rights
 // unioned. Entries present in only one profile are kept.
+//
+// Rights that end up outside the merged handled sets are pruned from rules,
+// since they are implicitly allowed anyway and the kernel rejects rules that
+// grant unhandled rights. Both Intersect and Union apply this, so their
+// results pass ValidateStrict when the inputs use absolute paths.
 func Union(profiles ...*Profile) (*Profile, error) {
 	return foldProfiles(profiles, unionStrategy{})
 }
@@ -99,9 +104,58 @@ func foldProfiles(profiles []*Profile, mergeOp strategy) (*Profile, error) {
 		return nil, fmt.Errorf("fold: %w", err)
 	}
 
+	pruneUnhandledRights(result)
 	sortProfile(result)
 
 	return result, nil
+}
+
+// pruneUnhandledRights drops rule rights outside the handled sets and rules
+// left without rights. Unhandled rights are implicitly allowed, so this does
+// not change what the profile permits, but the kernel rejects a rule whose
+// rights are not a subset of the ruleset's handled access.
+func pruneUnhandledRights(profile *Profile) {
+	profile.PathRules = pruneRules(
+		profile.PathRules, profile.HandledAccessFS, pathRuleAccess, newPathRule, pathRuleKey,
+	)
+	profile.NetRules = pruneRules(
+		profile.NetRules, profile.HandledAccessNet, netRuleAccess, newNetRule, netRuleKey,
+	)
+}
+
+func pruneRules[Rule any, Key comparable, Right comparable](
+	rules []Rule,
+	handled []Right,
+	access func(Rule) []Right,
+	build func(Key, []Right) Rule,
+	key func(Rule) Key,
+) []Rule {
+	if len(rules) == 0 {
+		return nil
+	}
+
+	handledSet := toSet(handled)
+	result := make([]Rule, 0, len(rules))
+
+	for _, rule := range rules {
+		kept := make([]Right, 0, len(access(rule)))
+
+		for _, right := range access(rule) {
+			if _, ok := handledSet[right]; ok {
+				kept = append(kept, right)
+			}
+		}
+
+		if len(kept) > 0 {
+			result = append(result, build(key(rule), kept))
+		}
+	}
+
+	if len(result) == 0 {
+		return nil
+	}
+
+	return result
 }
 
 func sortProfile(profile *Profile) {
