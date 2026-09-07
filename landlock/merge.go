@@ -20,8 +20,10 @@ package landlock
 import (
 	"cmp"
 	"fmt"
+	"maps"
 	"path/filepath"
 	"slices"
+	"strings"
 
 	"github.com/saschagrunert/security-profiles-merger/internal/merge"
 )
@@ -37,10 +39,13 @@ var (
 // profile restricts access to the intersection of what all input profiles
 // allow. HandledAccessFS and HandledAccessNet are unioned (handling more rights
 // makes the ruleset more restrictive overall, because unhandled rights are
-// implicitly allowed). Path and network rules for entries present in both
-// profiles have their access rights intersected. Entries present in only one
-// profile are dropped if the corresponding access right is handled by the other
-// profile, or kept as-is otherwise.
+// implicitly allowed).
+//
+// A right is granted for a path or port only if every profile permits it
+// there: either the profile does not handle the right, or one of its rules
+// grants it. Path rules apply to the whole hierarchy beneath their path, so a
+// rule on "/etc" is honored against a rule on "/" from the other profile and
+// the result carries the narrower path. Network rules match by exact port.
 func Intersect(profiles ...*Profile) (*Profile, error) {
 	return foldProfiles(profiles, intersectStrategy{})
 }
@@ -163,9 +168,9 @@ func (intersectStrategy) mergePathRules(
 ) []PathRule {
 	return intersectRules(
 		left.PathRules, right.PathRules,
-		right.HandledAccessFS, left.HandledAccessFS,
-		pathRuleKey, pathRuleAccess,
-		newPathRule, fsHandledSet, fsFilterUnhandled,
+		left.HandledAccessFS, right.HandledAccessFS,
+		pathRuleKey, pathRuleAccess, newPathRule,
+		hierarchyAccess,
 	)
 }
 
@@ -174,57 +179,123 @@ func (intersectStrategy) mergeNetRules(
 ) []NetRule {
 	return intersectRules(
 		left.NetRules, right.NetRules,
-		right.HandledAccessNet, left.HandledAccessNet,
-		netRuleKey, netRuleAccess,
-		newNetRule, netHandledSet, netFilterUnhandled,
+		left.HandledAccessNet, right.HandledAccessNet,
+		netRuleKey, netRuleAccess, newNetRule,
+		directAccess[uint16, NetAccessRight],
 	)
 }
 
-// intersectRules is a generic intersection for keyed rule slices.
-// It avoids duplicating the path-rule and net-rule intersection logic.
-func intersectRules[Rule any, Key comparable, Right comparable, Handled comparable](
+// intersectRules is a generic intersection for keyed rule slices. For every
+// key present on either side it computes the rights each side effectively
+// grants there (via the effective function, which may consult ancestor
+// rules) and keeps the rights both sides permit.
+func intersectRules[Rule any, Key cmp.Ordered, Right comparable](
 	leftRules, rightRules []Rule,
-	rightHandledRights, leftHandledRights []Handled,
+	leftHandled, rightHandled []Right,
 	key func(Rule) Key,
 	access func(Rule) []Right,
 	build func(Key, []Right) Rule,
-	handledSet func([]Handled) map[Handled]struct{},
-	filterUnhandled func([]Right, map[Handled]struct{}) []Right,
+	effective func(Key, map[Key][]Right) []Right,
 ) []Rule {
 	leftMap := ruleMap(leftRules, key, access)
 	rightMap := ruleMap(rightRules, key, access)
+	leftHandledSet := toSet(leftHandled)
+	rightHandledSet := toSet(rightHandled)
 
-	rightHandled := handledSet(rightHandledRights)
-	leftHandled := handledSet(leftHandledRights)
+	keys := slices.Collect(maps.Keys(leftMap))
 
-	result := make([]Rule, 0, len(leftRules)+len(rightRules))
-
-	for ruleKey, leftAccess := range leftMap {
-		if rightAccess, ok := rightMap[ruleKey]; ok {
-			intersected := merge.IntersectSlice(leftAccess, rightAccess)
-			if len(intersected) > 0 {
-				result = append(result, build(ruleKey, intersected))
-			}
-		} else if filtered := filterUnhandled(
-			leftAccess, rightHandled,
-		); len(filtered) > 0 {
-			result = append(result, build(ruleKey, filtered))
+	for ruleKey := range rightMap {
+		if _, ok := leftMap[ruleKey]; !ok {
+			keys = append(keys, ruleKey)
 		}
 	}
 
-	for ruleKey, rightAccess := range rightMap {
-		if _, ok := leftMap[ruleKey]; ok {
-			continue
-		}
+	slices.Sort(keys)
 
-		if filtered := filterUnhandled(
-			rightAccess, leftHandled,
-		); len(filtered) > 0 {
-			result = append(result, build(ruleKey, filtered))
+	result := make([]Rule, 0, len(keys))
+
+	for _, ruleKey := range keys {
+		granted := intersectAccess(
+			effective(ruleKey, leftMap), effective(ruleKey, rightMap),
+			leftHandledSet, rightHandledSet,
+		)
+		if len(granted) > 0 {
+			result = append(result, build(ruleKey, granted))
 		}
 	}
 
 	return result
+}
+
+// intersectAccess returns the rights permitted by both sides. A side permits
+// a right if it does not handle it (unhandled rights are implicitly allowed)
+// or if its effective rules grant it.
+func intersectAccess[Right comparable](
+	leftAccess, rightAccess []Right,
+	leftHandled, rightHandled map[Right]struct{},
+) []Right {
+	leftSet := toSet(leftAccess)
+	rightSet := toSet(rightAccess)
+
+	var granted []Right
+
+	for _, right := range merge.UnionSlice(leftAccess, rightAccess) {
+		if permits(right, leftSet, leftHandled) && permits(right, rightSet, rightHandled) {
+			granted = append(granted, right)
+		}
+	}
+
+	return granted
+}
+
+func permits[Right comparable](
+	right Right, access, handled map[Right]struct{},
+) bool {
+	if _, ok := handled[right]; !ok {
+		return true
+	}
+
+	_, ok := access[right]
+
+	return ok
+}
+
+// directAccess returns the rights of the rule with exactly the given key.
+func directAccess[Key comparable, Right comparable](
+	ruleKey Key, rules map[Key][]Right,
+) []Right {
+	return rules[ruleKey]
+}
+
+// hierarchyAccess returns the rights granted for a path by every rule on the
+// path itself or one of its ancestors. Landlock rules cover the whole file
+// hierarchy beneath their path and rights from nested rules accumulate.
+func hierarchyAccess(
+	path string, rules map[string][]FSAccessRight,
+) []FSAccessRight {
+	var result []FSAccessRight
+
+	for rulePath, access := range rules {
+		if isAncestorOrSelf(rulePath, path) {
+			result = merge.UnionSlice(result, access)
+		}
+	}
+
+	return result
+}
+
+// isAncestorOrSelf reports whether ancestor is path itself or one of its
+// parent directories. Paths are expected to be cleaned.
+func isAncestorOrSelf(ancestor, path string) bool {
+	if ancestor == path {
+		return true
+	}
+
+	if ancestor == "/" {
+		return strings.HasPrefix(path, "/")
+	}
+
+	return strings.HasPrefix(path, ancestor+"/")
 }
 
 // unionStrategy implements union semantics for Landlock profiles.
@@ -339,52 +410,13 @@ func ruleMap[Rule any, Key comparable, Right comparable](
 	return result
 }
 
-func fsHandledSet(
-	rights []FSAccessRight,
-) map[FSAccessRight]struct{} {
-	return toSet(rights)
-}
-
-func netHandledSet(
-	rights []NetAccessRight,
-) map[NetAccessRight]struct{} {
-	return toSet(rights)
-}
-
 func toSet[T comparable](items []T) map[T]struct{} {
 	set := make(map[T]struct{}, len(items))
-
 	for _, item := range items {
 		set[item] = struct{}{}
 	}
 
 	return set
-}
-
-func fsFilterUnhandled(
-	access []FSAccessRight, handled map[FSAccessRight]struct{},
-) []FSAccessRight {
-	return filterBySet(access, handled)
-}
-
-func netFilterUnhandled(
-	access []NetAccessRight, handled map[NetAccessRight]struct{},
-) []NetAccessRight {
-	return filterBySet(access, handled)
-}
-
-func filterBySet[T comparable](
-	items []T, exclude map[T]struct{},
-) []T {
-	result := make([]T, 0, len(items))
-
-	for _, item := range items {
-		if _, ok := exclude[item]; !ok {
-			result = append(result, item)
-		}
-	}
-
-	return result
 }
 
 func cloneProfile(profile *Profile) *Profile {

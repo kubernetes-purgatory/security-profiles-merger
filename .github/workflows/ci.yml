@@ -102,7 +102,7 @@ jobs:
           path: ${{ matrix.fuzz.package }}testdata/fuzz
           key: fuzz-${{ matrix.fuzz.name }}-${{ github.sha }}
           restore-keys: fuzz-${{ matrix.fuzz.name }}-
-      - run: go test -fuzz=${{ matrix.fuzz.target }} -fuzztime=30s ${{ matrix.fuzz.package }}
+      - run: go test -fuzz="^${{ matrix.fuzz.target }}\$" -fuzztime=30s ${{ matrix.fuzz.package }}
 
   benchmark:
     runs-on: ubuntu-latest

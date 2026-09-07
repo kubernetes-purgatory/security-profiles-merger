@@ -10,6 +10,7 @@
   - [Functions](#functions-1)
   - [Types](#types-1)
   - [Errors](#errors-1)
+  - [Glob patterns](#glob-patterns)
   - [Nil vs empty semantics](#nil-vs-empty-semantics)
   - [Filesystem merge](#filesystem-merge)
 - [landlock](#landlock)
@@ -81,12 +82,28 @@ in the [package reference](https://pkg.go.dev/github.com/saschagrunert/security-
   Callers that need precise architecture intersection should populate the native
   architecture explicitly before merging.
 - Flags: intersection keeps only flags present in all profiles; union combines
-  all. An empty flag list is treated as "unspecified" and defers to the other
-  profile during intersection, matching the architecture behavior.
-- Argument filters: during intersection, non-identical argument filters result
-  in a conservative denial (`SCMP_ACT_KILL_PROCESS`). During union, argument
-  filters from both sides are combined. When only one side has argument filters,
-  intersection keeps them and union drops them.
+  all. An empty flag list means "no flags", so intersecting with it yields no
+  flags. This keeps an OCI-pulled profile from enabling
+  `SECCOMP_FILTER_FLAG_SPEC_ALLOW` over a baseline that did not set it.
+- Evaluation model: within a profile, a syscall entry with argument filters
+  applies to calls matching all of its filters. If several conditional entries
+  match, the least restrictive action applies. If none matches, an
+  unconditional entry for the syscall applies, otherwise the profile default.
+  Multiple entries for the same syscall (an OR of filters) are preserved.
+- Argument filters during intersection: for each call, the more restrictive
+  action of the two profiles is chosen. Filters on different argument indices
+  are conjoined into one entry, identical filters are kept, and filters that
+  provably never overlap (for example `arg0 == 1` and `arg0 == 2`) produce no
+  shared entry. Where the exact intersection is not expressible in OCI terms,
+  such as different conditions on the same argument index, the affected calls
+  fall back to the more restrictive surrounding action. The result never
+  permits a call that any input denies.
+- Argument filters during union: every conditional entry of every input is
+  kept, with its action raised to the least restrictive action any input
+  applies to matching calls. The result never denies a call that any input
+  permits.
+- Output grouping: entries sharing the same action, errno, and argument filters
+  are emitted as one multi-name entry, sorted by name.
 - `DefaultErrnoRet` is taken from whichever profile's default action is selected.
   When both profiles share the same action, the earlier (leftmost) profile's
   `DefaultErrnoRet` wins. The same applies to per-syscall `ErrnoRet`.
@@ -96,7 +113,9 @@ in the [package reference](https://pkg.go.dev/github.com/saschagrunert/security-
 
 `KILL_PROCESS > KILL_THREAD > TRAP > ERRNO > NOTIFY > TRACE > LOG > ALLOW`
 
-Unknown actions are treated as maximally restrictive.
+`MoreRestrictive` and `LessRestrictive` treat unknown actions as maximally
+restrictive. `Intersect` and `Union` validate their inputs first and reject
+unknown actions with `ErrUnknownAction`.
 
 ## apparmor
 
@@ -138,6 +157,19 @@ documented in the
 Sentinel errors (`ErrNoProfiles`, `ErrNilProfile`, `ErrDuplicatePath`,
 `ErrUnknownCapability`, `ErrDuplicateExecutablePath`, etc.) are documented
 in the [package reference](https://pkg.go.dev/github.com/saschagrunert/security-profiles-merger/apparmor#pkg-variables).
+
+### Glob patterns
+
+Paths may use AppArmor glob syntax: `*` (any characters except `/`), `**`
+(any characters including `/`), `?` (one character except `/`), character
+classes such as `[abc]`, `[a-z]`, and `[^a]`, and alternations such as
+`{a,b}`, which may nest and may contain further glob tokens. A backslash
+escapes the following character. On intersection a literal path survives when
+a glob on the other side matches it, and two globs survive only when one is
+the other's `**` prefix expansion or they are identical. On union a glob prunes
+literals it matches. Patterns longer than 4096 bytes or with more than 100
+alternatives in total never match, so they are dropped on intersection and
+kept verbatim on union.
 
 ### Nil vs empty semantics
 
@@ -214,8 +246,11 @@ scoped sets follow the same inverted semantics as handled access sets.
 
 ### Path and network rules
 
-During intersection, rules for entries present in both profiles have their
-access rights intersected. Entries only in one profile are dropped if the access
-right is handled by the other profile, or kept if unhandled. During union,
-access rights are combined for matching entries, and all non-matching entries are
-kept.
+During intersection, a right is granted for a path or port only if every
+profile permits it there. A profile permits a right if it does not handle the
+right (unhandled rights are implicitly allowed) or if one of its rules grants
+it. Path rules cover the whole hierarchy beneath their path and rights from
+nested rules accumulate, so a rule on `/etc` in one profile intersected with a
+rule on `/` in the other yields a rule on `/etc`. Network rules match by exact
+port. During union, access rights are combined for matching entries, and all
+non-matching entries are kept.

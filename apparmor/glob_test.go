@@ -243,10 +243,16 @@ func TestUnionGlobLiteral(t *testing.T) {
 			want:  []string{pathBinBash, "/usr/bin/bash2"},
 		},
 		{
-			name:  "brackets are escaped",
+			name:  "character class prunes covered literal",
 			left:  []string{"/etc/config[1]"},
 			right: []string{"/etc/config1"},
-			want:  []string{"/etc/config1", "/etc/config[1]"},
+			want:  []string{"/etc/config[1]"},
+		},
+		{
+			name:  "escaped brackets are literal",
+			left:  []string{`/etc/config\[1]`},
+			right: []string{"/etc/config1"},
+			want:  []string{"/etc/config1", `/etc/config\[1]`},
 		},
 		{
 			name:  "plus sign is escaped",

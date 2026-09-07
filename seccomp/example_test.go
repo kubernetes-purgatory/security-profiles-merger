@@ -18,6 +18,7 @@ package seccomp_test
 
 import (
 	"fmt"
+	"strings"
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 
@@ -112,12 +113,11 @@ func ExampleUnionSyscalls() {
 	)
 
 	for _, sc := range result {
-		fmt.Printf("%s -> %s\n", sc.Names[0], sc.Action)
+		fmt.Printf("%s -> %s\n", strings.Join(sc.Names, ","), sc.Action)
 	}
 
 	// Output:
-	// read -> SCMP_ACT_ALLOW
-	// write -> SCMP_ACT_ALLOW
+	// read,write -> SCMP_ACT_ALLOW
 }
 
 func ExampleIntersectSyscalls() {
@@ -255,11 +255,10 @@ func ExampleUnion() {
 	fmt.Println("Default:", result.DefaultAction)
 
 	for _, sc := range result.Syscalls {
-		fmt.Println("Syscall:", sc.Names[0], "->", sc.Action)
+		fmt.Println("Syscall:", strings.Join(sc.Names, ","), "->", sc.Action)
 	}
 
 	// Output:
 	// Default: SCMP_ACT_ERRNO
-	// Syscall: read -> SCMP_ACT_ALLOW
-	// Syscall: write -> SCMP_ACT_ALLOW
+	// Syscall: read,write -> SCMP_ACT_ALLOW
 }

@@ -51,7 +51,7 @@ const (
 const usage = `Usage: spm <command> [options] [files...]
 
 Commands:
-  merge      Merge two or more security profiles
+  merge      Merge one or more security profiles
   validate   Validate one or more security profiles
   diff       Compare two security profiles
   version    Print the version

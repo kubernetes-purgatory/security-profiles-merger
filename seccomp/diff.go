@@ -555,11 +555,11 @@ func formatSyscallsDiff(syscallsDiff *SyscallsDiff) []string {
 	)
 
 	for _, entry := range syscallsDiff.Removed {
-		parts = append(parts, "-"+entry.Name+"->"+string(entry.Action))
+		parts = append(parts, "-"+entry.String())
 	}
 
 	for _, entry := range syscallsDiff.Added {
-		parts = append(parts, "+"+entry.Name+"->"+string(entry.Action))
+		parts = append(parts, "+"+entry.String())
 	}
 
 	for _, change := range syscallsDiff.Changed {
@@ -578,7 +578,7 @@ func formatDetailActions(details []SyscallDetail) string {
 	actions := make([]string, 0, len(details))
 
 	for _, detail := range details {
-		actions = append(actions, string(detail.Action))
+		actions = append(actions, detail.String())
 	}
 
 	return strings.Join(actions, ",")
