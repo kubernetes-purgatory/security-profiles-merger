@@ -244,7 +244,7 @@ func (intersectStrategy) mergeFilesystem(left, right *FilesystemRules) *Filesyst
 
 	// Literal-vs-literal intersection via map lookup: O(n+m).
 	for path, leftPerm := range leftPerms {
-		if globTokenRe.MatchString(path) {
+		if IsGlobPattern(path) {
 			continue
 		}
 
@@ -320,7 +320,7 @@ func (unionStrategy) mergePaths(left, right []string) []string {
 	set := newPathSet(left)
 
 	for _, path := range right {
-		if globTokenRe.MatchString(path) || !set.matches(path) {
+		if IsGlobPattern(path) || !set.matches(path) {
 			set.add(path)
 		}
 	}
@@ -379,7 +379,7 @@ func addReadWritePaths(
 			continue
 		}
 
-		isGlob := globTokenRe.MatchString(path)
+		isGlob := IsGlobPattern(path)
 
 		if !isGlob && (readSet.matches(path) || writeSet.matches(path)) {
 			rwSet.add(path)
@@ -411,7 +411,7 @@ func addReadOnlyPaths(
 			continue
 		}
 
-		isGlob := globTokenRe.MatchString(path)
+		isGlob := IsGlobPattern(path)
 
 		if !isGlob && writeSet.matches(path) {
 			rwSet.add(path)
@@ -442,7 +442,7 @@ func addWriteOnlyPaths(
 			continue
 		}
 
-		isGlob := globTokenRe.MatchString(path)
+		isGlob := IsGlobPattern(path)
 
 		if !isGlob && readSet.matches(path) {
 			rwSet.add(path)
@@ -682,7 +682,7 @@ func normalizePaths(paths []string) []string {
 	result := make([]string, len(paths))
 
 	for idx, p := range paths {
-		if globTokenRe.MatchString(p) {
+		if IsGlobPattern(p) {
 			result[idx] = normalizeGlobPath(p)
 		} else {
 			result[idx] = filepath.Clean(p)

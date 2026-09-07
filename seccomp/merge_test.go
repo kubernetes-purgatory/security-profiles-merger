@@ -151,7 +151,7 @@ func TestIntersectOverlappingSyscalls(t *testing.T) {
 	}
 }
 
-func TestIntersectDifferentArgsDenied(t *testing.T) {
+func TestIntersectDisjointArgsFallsToDefault(t *testing.T) {
 	t.Parallel()
 
 	left := &specs.LinuxSeccomp{
@@ -159,7 +159,7 @@ func TestIntersectDifferentArgsDenied(t *testing.T) {
 		Syscalls: []specs.LinuxSyscall{{
 			Names:  []string{syscallClone},
 			Action: specs.ActAllow,
-			Args:   []specs.LinuxSeccompArg{{Index: 0, Value: 0x10000, Op: specs.OpMaskedEqual}},
+			Args:   []specs.LinuxSeccompArg{{Index: 0, Value: 1, Op: specs.OpEqualTo}},
 		}},
 	}
 
@@ -168,7 +168,7 @@ func TestIntersectDifferentArgsDenied(t *testing.T) {
 		Syscalls: []specs.LinuxSyscall{{
 			Names:  []string{syscallClone},
 			Action: specs.ActAllow,
-			Args:   []specs.LinuxSeccompArg{{Index: 0, Value: 0x20000, Op: specs.OpMaskedEqual}},
+			Args:   []specs.LinuxSeccompArg{{Index: 0, Value: 2, Op: specs.OpEqualTo}},
 		}},
 	}
 
@@ -177,34 +177,88 @@ func TestIntersectDifferentArgsDenied(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	found := false
-
+	// Neither side allows any call the other allows, so clone is denied by
+	// the merged default and no entry is emitted.
 	for _, syscall := range result.Syscalls {
-		for _, name := range syscall.Names {
-			if name == syscallClone {
-				found = true
-
-				if syscall.Action != specs.ActKillProcess {
-					t.Errorf(
-						"clone action = %q, want %q (conservative denial)",
-						syscall.Action,
-						specs.ActKillProcess,
-					)
-				}
-
-				if len(syscall.Args) != 0 {
-					t.Errorf(
-						"clone should have no args after conservative denial, got %d",
-						len(syscall.Args),
-					)
-				}
-			}
+		if slices.Contains(syscall.Names, syscallClone) {
+			t.Errorf("clone should fall back to the default, got %s", seccomp.FormatProfile(result))
 		}
 	}
+}
 
-	if !found {
-		t.Error("clone not found in result")
-	}
+func TestIntersectOverlappingArgsSameIndexConservative(t *testing.T) {
+	t.Parallel()
+
+	// [0]>=1 and [0]<=5 overlap on 1..5 but cannot be conjoined into a
+	// single OCI entry (one condition per index). The overlap falls back to
+	// the more restrictive surrounding action.
+	t.Run("allow clauses drop to deny default", func(t *testing.T) {
+		t.Parallel()
+
+		left := &specs.LinuxSeccomp{
+			DefaultAction: specs.ActErrno,
+			Syscalls: []specs.LinuxSyscall{{
+				Names:  []string{syscallClone},
+				Action: specs.ActAllow,
+				Args:   []specs.LinuxSeccompArg{{Index: 0, Value: 1, Op: specs.OpGreaterEqual}},
+			}},
+		}
+
+		right := &specs.LinuxSeccomp{
+			DefaultAction: specs.ActErrno,
+			Syscalls: []specs.LinuxSyscall{{
+				Names:  []string{syscallClone},
+				Action: specs.ActAllow,
+				Args:   []specs.LinuxSeccompArg{{Index: 0, Value: 5, Op: specs.OpLessEqual}},
+			}},
+		}
+
+		result, err := seccomp.Intersect(left, right)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		if len(result.Syscalls) != 0 {
+			t.Errorf("expected no entries, got %s", seccomp.FormatProfile(result))
+		}
+	})
+
+	t.Run("deny clauses are both kept", func(t *testing.T) {
+		t.Parallel()
+
+		left := &specs.LinuxSeccomp{
+			DefaultAction: specs.ActAllow,
+			Syscalls: []specs.LinuxSyscall{{
+				Names:  []string{syscallClone},
+				Action: specs.ActErrno,
+				Args:   []specs.LinuxSeccompArg{{Index: 0, Value: 1, Op: specs.OpGreaterEqual}},
+			}},
+		}
+
+		right := &specs.LinuxSeccomp{
+			DefaultAction: specs.ActAllow,
+			Syscalls: []specs.LinuxSyscall{{
+				Names:  []string{syscallClone},
+				Action: specs.ActErrno,
+				Args:   []specs.LinuxSeccompArg{{Index: 0, Value: 5, Op: specs.OpLessEqual}},
+			}},
+		}
+
+		result, err := seccomp.Intersect(left, right)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		if len(result.Syscalls) != 2 {
+			t.Fatalf("expected 2 entries, got %s", seccomp.FormatProfile(result))
+		}
+
+		for _, syscall := range result.Syscalls {
+			if syscall.Action != specs.ActErrno || len(syscall.Args) != 1 {
+				t.Errorf("unexpected entry %v", syscall)
+			}
+		}
+	})
 }
 
 func TestIntersectIdenticalArgs(t *testing.T) {
@@ -489,24 +543,27 @@ func TestUnionWithDifferentArgs(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
+	// Both filters are preserved as separate entries: clone is allowed when
+	// either filter matches and denied by the default otherwise.
+	var entries int
+
 	for _, syscall := range result.Syscalls {
 		if slices.Contains(syscall.Names, syscallClone) {
+			entries++
+
 			if syscall.Action != specs.ActAllow {
 				t.Errorf("clone action = %q, want %q", syscall.Action, specs.ActAllow)
 			}
 
-			if len(syscall.Args) != 0 {
-				t.Errorf(
-					"clone args count = %d, want 0 (union drops args when they differ)",
-					len(syscall.Args),
-				)
+			if len(syscall.Args) != 1 {
+				t.Errorf("clone args count = %d, want 1", len(syscall.Args))
 			}
-
-			return
 		}
 	}
 
-	t.Error("clone not found in result")
+	if entries != 2 {
+		t.Errorf("clone entries = %d, want 2", entries)
+	}
 }
 
 func TestUnionWithOneEmptyArgs(t *testing.T) {
@@ -634,8 +691,8 @@ func TestIntersectFlagsOneEmpty(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	if len(result.Flags) != 1 || result.Flags[0] != specs.LinuxSeccompFlagLog {
-		t.Errorf("flags = %v, want [Log] (empty defers to other)", result.Flags)
+	if len(result.Flags) != 0 {
+		t.Errorf("flags = %v, want none (empty means no flags)", result.Flags)
 	}
 }
 
@@ -1403,21 +1460,14 @@ func TestIntersectArgsSameIndexDifferentValues(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
+	// The masks on index 0 cannot be conjoined into one entry and may
+	// overlap, so the clause drops to the more restrictive default and is
+	// elided.
 	for _, syscall := range result.Syscalls {
 		if slices.Contains(syscall.Names, syscallClone) {
-			if syscall.Action != specs.ActKillProcess {
-				t.Errorf(
-					"clone action = %q, want %q (conservative denial)",
-					syscall.Action,
-					specs.ActKillProcess,
-				)
-			}
-
-			return
+			t.Errorf("clone should fall back to the default, got %s", seccomp.FormatProfile(result))
 		}
 	}
-
-	t.Error("clone not found in result")
 }
 
 func TestIntersectArgsMixedIndices(t *testing.T) {
@@ -1621,7 +1671,7 @@ func TestUnionSyscallsDifferent(t *testing.T) {
 		[]specs.LinuxSyscall{{Names: []string{syscallWrite}, Action: specs.ActAllow}},
 	)
 
-	assertUnionSyscallsResult(t, result, map[string]specs.LinuxSeccompAction{
+	assertSyscallsResult(t, result, map[string]specs.LinuxSeccompAction{
 		syscallRead:  specs.ActAllow,
 		syscallWrite: specs.ActAllow,
 	})
@@ -1635,7 +1685,7 @@ func TestUnionSyscallsLessRestrictive(t *testing.T) {
 		[]specs.LinuxSyscall{{Names: []string{syscallRead}, Action: specs.ActAllow}},
 	)
 
-	assertUnionSyscallsResult(t, result, map[string]specs.LinuxSeccompAction{
+	assertSyscallsResult(t, result, map[string]specs.LinuxSeccompAction{
 		syscallRead: specs.ActAllow,
 	})
 }
@@ -1648,7 +1698,7 @@ func TestUnionSyscallsPreservesKillProcess(t *testing.T) {
 		[]specs.LinuxSyscall{{Names: []string{syscallWrite}, Action: specs.ActAllow}},
 	)
 
-	assertUnionSyscallsResult(t, result, map[string]specs.LinuxSeccompAction{
+	assertSyscallsResult(t, result, map[string]specs.LinuxSeccompAction{
 		syscallRead:  specs.ActKillProcess,
 		syscallWrite: specs.ActAllow,
 	})
@@ -1664,7 +1714,7 @@ func TestUnionSyscallsEmptyRight(t *testing.T) {
 		nil,
 	)
 
-	assertUnionSyscallsResult(t, result, map[string]specs.LinuxSeccompAction{
+	assertSyscallsResult(t, result, map[string]specs.LinuxSeccompAction{
 		syscallRead:  specs.ActAllow,
 		syscallWrite: specs.ActAllow,
 	})
@@ -1680,7 +1730,7 @@ func TestUnionSyscallsNormalizesMultiName(t *testing.T) {
 		[]specs.LinuxSyscall{{Names: []string{syscallWrite}, Action: specs.ActLog}},
 	)
 
-	assertUnionSyscallsResult(t, result, map[string]specs.LinuxSeccompAction{
+	assertSyscallsResult(t, result, map[string]specs.LinuxSeccompAction{
 		syscallRead:  specs.ActAllow,
 		syscallWrite: specs.ActAllow,
 		syscallOpen:  specs.ActAllow,
@@ -1725,16 +1775,18 @@ func TestUnionSyscallsSorted(t *testing.T) {
 		[]specs.LinuxSyscall{{Names: []string{syscallRead}, Action: specs.ActAllow}},
 	)
 
-	if len(result) != 2 {
-		t.Fatalf("expected 2 entries, got %d", len(result))
+	if len(result) != 1 {
+		t.Fatalf("expected 1 grouped entry, got %d", len(result))
 	}
 
-	if result[0].Names[0] != syscallRead || result[1].Names[0] != syscallWrite {
-		t.Errorf("result not sorted: [%s, %s]", result[0].Names[0], result[1].Names[0])
+	if !slices.Equal(result[0].Names, []string{syscallRead, syscallWrite}) {
+		t.Errorf("names not sorted: %v", result[0].Names)
 	}
 }
 
-func assertUnionSyscallsResult(
+// assertSyscallsResult checks that every syscall name in want maps to the
+// given action, regardless of how the entries are grouped.
+func assertSyscallsResult(
 	t *testing.T,
 	result []specs.LinuxSyscall,
 	want map[string]specs.LinuxSeccompAction,
@@ -1744,11 +1796,13 @@ func assertUnionSyscallsResult(
 	got := make(map[string]specs.LinuxSeccompAction)
 
 	for _, syscall := range result {
-		if len(syscall.Names) != 1 {
-			t.Fatalf("expected single-name entry, got %v", syscall.Names)
-		}
+		for _, name := range syscall.Names {
+			if _, dup := got[name]; dup {
+				t.Fatalf("%s appears in more than one entry", name)
+			}
 
-		got[syscall.Names[0]] = syscall.Action
+			got[name] = syscall.Action
+		}
 	}
 
 	if len(got) != len(want) {
@@ -1772,7 +1826,7 @@ func TestIntersectSyscallsCommon(t *testing.T) {
 		[]specs.LinuxSyscall{{Names: []string{syscallRead}, Action: specs.ActAllow}},
 	)
 
-	assertIntersectSyscallsResult(t, result, map[string]specs.LinuxSeccompAction{
+	assertSyscallsResult(t, result, map[string]specs.LinuxSeccompAction{
 		syscallRead: specs.ActAllow,
 	})
 }
@@ -1785,7 +1839,7 @@ func TestIntersectSyscallsMoreRestrictive(t *testing.T) {
 		[]specs.LinuxSyscall{{Names: []string{syscallRead}, Action: specs.ActErrno}},
 	)
 
-	assertIntersectSyscallsResult(t, result, map[string]specs.LinuxSeccompAction{
+	assertSyscallsResult(t, result, map[string]specs.LinuxSeccompAction{
 		syscallRead: specs.ActErrno,
 	})
 }
@@ -1813,7 +1867,7 @@ func TestIntersectSyscallsNormalizesMultiName(t *testing.T) {
 		[]specs.LinuxSyscall{{Names: []string{syscallWrite}, Action: specs.ActLog}},
 	)
 
-	assertIntersectSyscallsResult(t, result, map[string]specs.LinuxSeccompAction{
+	assertSyscallsResult(t, result, map[string]specs.LinuxSeccompAction{
 		syscallWrite: specs.ActLog,
 	})
 }
@@ -1832,12 +1886,12 @@ func TestIntersectSyscallsSorted(t *testing.T) {
 		},
 	)
 
-	if len(result) != 2 {
-		t.Fatalf("expected 2 entries, got %d", len(result))
+	if len(result) != 1 {
+		t.Fatalf("expected 1 grouped entry, got %d", len(result))
 	}
 
-	if result[0].Names[0] != syscallRead || result[1].Names[0] != syscallWrite {
-		t.Errorf("result not sorted: [%s, %s]", result[0].Names[0], result[1].Names[0])
+	if !slices.Equal(result[0].Names, []string{syscallRead, syscallWrite}) {
+		t.Errorf("names not sorted: %v", result[0].Names)
 	}
 }
 
@@ -1851,36 +1905,6 @@ func TestIntersectSyscallsEmptyInput(t *testing.T) {
 
 	if len(result) != 0 {
 		t.Fatalf("expected empty result, got %v", result)
-	}
-}
-
-func assertIntersectSyscallsResult(
-	t *testing.T,
-	result []specs.LinuxSyscall,
-	want map[string]specs.LinuxSeccompAction,
-) {
-	t.Helper()
-
-	got := make(map[string]specs.LinuxSeccompAction)
-
-	for _, syscall := range result {
-		if len(syscall.Names) != 1 {
-			t.Fatalf("expected single-name entry, got %v", syscall.Names)
-		}
-
-		got[syscall.Names[0]] = syscall.Action
-	}
-
-	if len(got) != len(want) {
-		t.Fatalf("got %d entries, want %d", len(got), len(want))
-	}
-
-	for name, wantAction := range want {
-		if gotAction, ok := got[name]; !ok {
-			t.Errorf("%s not found in result", name)
-		} else if gotAction != wantAction {
-			t.Errorf("%s action = %q, want %q", name, gotAction, wantAction)
-		}
 	}
 }
 
@@ -2145,7 +2169,7 @@ func TestIntersectSyscallsWithSameArgs(t *testing.T) {
 	}
 }
 
-func TestIntersectSyscallsConservativeDenialOnDifferentArgs(t *testing.T) {
+func TestIntersectSyscallsDisjointArgsDropped(t *testing.T) {
 	t.Parallel()
 
 	result := seccomp.IntersectSyscalls(
@@ -2161,16 +2185,8 @@ func TestIntersectSyscallsConservativeDenialOnDifferentArgs(t *testing.T) {
 		}},
 	)
 
-	if len(result) != 1 {
-		t.Fatalf("expected 1 entry, got %d", len(result))
-	}
-
-	if result[0].Action != specs.ActKillProcess {
-		t.Errorf("expected conservative denial (KILL_PROCESS), got %s", result[0].Action)
-	}
-
-	if len(result[0].Args) != 0 {
-		t.Errorf("expected no args after conservative denial, got %v", result[0].Args)
+	if len(result) != 0 {
+		t.Fatalf("expected no entries for disjoint filters, got %v", result)
 	}
 }
 
@@ -2255,7 +2271,7 @@ func TestUnionElidesMatchingDefaultErrnoRet(t *testing.T) {
 	}
 }
 
-func TestUnionSyscallsDropsArgsWhenDifferent(t *testing.T) {
+func TestUnionSyscallsKeepsArgsWhenDifferent(t *testing.T) {
 	t.Parallel()
 
 	result := seccomp.UnionSyscalls(
@@ -2271,15 +2287,14 @@ func TestUnionSyscallsDropsArgsWhenDifferent(t *testing.T) {
 		}},
 	)
 
-	if len(result) != 1 {
-		t.Fatalf("expected 1 entry, got %d", len(result))
+	if len(result) != 2 {
+		t.Fatalf("expected 2 entries (one per filter), got %d", len(result))
 	}
 
-	if len(result[0].Args) != 0 {
-		t.Errorf(
-			"expected no args (union drops to unconstrained when args differ), got %v",
-			result[0].Args,
-		)
+	for _, entry := range result {
+		if len(entry.Args) != 1 || entry.Action != specs.ActAllow {
+			t.Errorf("unexpected entry %v", entry)
+		}
 	}
 }
 
@@ -2477,5 +2492,154 @@ func TestUnionUnmatchedSyscallElidesWhenErrnoMatchesDefault(t *testing.T) {
 				syscall.Action,
 			)
 		}
+	}
+}
+
+func TestIntersectMultiEntryBaselineNotWidened(t *testing.T) {
+	t.Parallel()
+
+	arg := func(val uint64) []specs.LinuxSeccompArg {
+		return []specs.LinuxSeccompArg{{Index: 0, Value: val, Op: specs.OpEqualTo}}
+	}
+
+	baseline := &specs.LinuxSeccomp{
+		DefaultAction: specs.ActErrno,
+		Syscalls: []specs.LinuxSyscall{
+			{Names: []string{"personality"}, Action: specs.ActAllow, Args: arg(0)},
+			{Names: []string{"personality"}, Action: specs.ActAllow, Args: arg(8)},
+		},
+	}
+
+	unconditional := &specs.LinuxSeccomp{
+		DefaultAction: specs.ActErrno,
+		Syscalls: []specs.LinuxSyscall{
+			{Names: []string{"personality"}, Action: specs.ActAllow},
+		},
+	}
+
+	result, err := seccomp.Intersect(baseline, unconditional)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(result.Syscalls) != 2 {
+		t.Fatalf("expected both filters to survive, got %s", seccomp.FormatProfile(result))
+	}
+
+	for _, syscall := range result.Syscalls {
+		if syscall.Action != specs.ActAllow || len(syscall.Args) != 1 {
+			t.Errorf("unexpected entry %v", syscall)
+		}
+	}
+}
+
+func TestIntersectUnconditionalDenyBeatsConditionalAllow(t *testing.T) {
+	t.Parallel()
+
+	left := &specs.LinuxSeccomp{
+		DefaultAction: specs.ActAllow,
+		Syscalls: []specs.LinuxSyscall{
+			{Names: []string{"socket"}, Action: specs.ActErrno},
+		},
+	}
+
+	right := &specs.LinuxSeccomp{
+		DefaultAction: specs.ActAllow,
+		Syscalls: []specs.LinuxSyscall{{
+			Names:  []string{"socket"},
+			Action: specs.ActAllow,
+			Args:   []specs.LinuxSeccompArg{{Index: 0, Value: 2, Op: specs.OpEqualTo}},
+		}},
+	}
+
+	for _, order := range [][]*specs.LinuxSeccomp{{left, right}, {right, left}} {
+		result, err := seccomp.Intersect(order...)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		if len(result.Syscalls) != 1 {
+			t.Fatalf("expected one entry, got %s", seccomp.FormatProfile(result))
+		}
+
+		entry := result.Syscalls[0]
+		if entry.Action != specs.ActErrno || len(entry.Args) != 0 {
+			t.Errorf("socket must be denied unconditionally, got %v", entry)
+		}
+	}
+}
+
+func TestIntersectSelfPreservesConditionalOverride(t *testing.T) {
+	t.Parallel()
+
+	profile := &specs.LinuxSeccomp{
+		DefaultAction: specs.ActAllow,
+		Syscalls: []specs.LinuxSyscall{
+			{Names: []string{"socket"}, Action: specs.ActErrno},
+			{
+				Names:  []string{"socket"},
+				Action: specs.ActAllow,
+				Args:   []specs.LinuxSeccompArg{{Index: 0, Value: 2, Op: specs.OpEqualTo}},
+			},
+		},
+	}
+
+	result, err := seccomp.Intersect(profile, profile)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	want := "Profile{default:SCMP_ACT_ALLOW socket->SCMP_ACT_ERRNO socket([0]SCMP_CMP_EQ:2)->SCMP_ACT_ALLOW}"
+	if got := seccomp.FormatProfile(result); got != want {
+		t.Errorf("Intersect(p, p) = %s, want %s", got, want)
+	}
+}
+
+func TestIntersectGroupsEqualEntries(t *testing.T) {
+	t.Parallel()
+
+	left := &specs.LinuxSeccomp{
+		DefaultAction: specs.ActErrno,
+		Syscalls: []specs.LinuxSyscall{
+			{Names: []string{syscallWrite, syscallRead, syscallOpen}, Action: specs.ActAllow},
+		},
+	}
+
+	right := &specs.LinuxSeccomp{
+		DefaultAction: specs.ActErrno,
+		Syscalls: []specs.LinuxSyscall{
+			{Names: []string{syscallRead}, Action: specs.ActAllow},
+			{Names: []string{syscallWrite}, Action: specs.ActAllow},
+			{Names: []string{syscallOpen}, Action: specs.ActLog},
+		},
+	}
+
+	result, err := seccomp.Intersect(left, right)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	want := "Profile{default:SCMP_ACT_ERRNO open->SCMP_ACT_LOG read,write->SCMP_ACT_ALLOW}"
+	if got := seccomp.FormatProfile(result); got != want {
+		t.Errorf("got %s, want %s", got, want)
+	}
+}
+
+func TestIntersectFlagsRequireBothSides(t *testing.T) {
+	t.Parallel()
+
+	baseline := &specs.LinuxSeccomp{DefaultAction: specs.ActErrno}
+	pulled := &specs.LinuxSeccomp{
+		DefaultAction: specs.ActErrno,
+		Flags:         []specs.LinuxSeccompFlag{specs.LinuxSeccompFlagSpecAllow},
+	}
+
+	result, err := seccomp.Intersect(baseline, pulled)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(result.Flags) != 0 {
+		t.Errorf("flags = %v, want none", result.Flags)
 	}
 }

@@ -24,9 +24,6 @@ import (
 )
 
 var (
-	// globTokenRe matches AppArmor glob tokens: **, *, ?, and {alt1,alt2,...}.
-	globTokenRe = regexp.MustCompile(`\*\*?|\?|\{[^}]+\}`)
-
 	// neverMatchRe is a fallback regex that matches nothing.
 	neverMatchRe = regexp.MustCompile(`^(?:$.)$`)
 
@@ -42,7 +39,170 @@ const (
 	maxGlobAlternatives   = 100
 	maxGlobCacheEntries   = 1024
 	globCacheEvictDivisor = 4
+	// escapedLen is the length of a backslash-escaped literal.
+	escapedLen = 2
 )
+
+// globToken is one lexical element of an AppArmor path pattern.
+type globToken int
+
+const (
+	// tokenLiteral is a literal character, possibly backslash-escaped.
+	tokenLiteral globToken = iota
+	// tokenStar is "*": any characters except "/".
+	tokenStar
+	// tokenDoubleStar is "**": any characters including "/".
+	tokenDoubleStar
+	// tokenQuestion is "?": a single character except "/".
+	tokenQuestion
+	// tokenClass is "[...]": a character class, optionally negated with
+	// "^" or "!".
+	tokenClass
+	// tokenAlternation is "{a,b,...}": alternatives, which may nest and may
+	// themselves contain glob tokens.
+	tokenAlternation
+)
+
+// scanToken classifies the token starting at pos and returns the index just
+// past it. Unbalanced "[" and "{" are literals.
+func scanToken(pattern string, pos int) (int, globToken) {
+	switch pattern[pos] {
+	case '\\':
+		return min(pos+escapedLen, len(pattern)), tokenLiteral
+	case '*':
+		if pos+1 < len(pattern) && pattern[pos+1] == '*' {
+			return pos + len("**"), tokenDoubleStar
+		}
+
+		return pos + 1, tokenStar
+	case '?':
+		return pos + 1, tokenQuestion
+	case '[':
+		if end, ok := scanClass(pattern, pos); ok {
+			return end, tokenClass
+		}
+	case '{':
+		if end, ok := scanAlternation(pattern, pos); ok {
+			return end, tokenAlternation
+		}
+	}
+
+	return pos + 1, tokenLiteral
+}
+
+// scanClass finds the closing bracket of a character class starting at pos.
+// A "]" directly after the opening bracket (or after a leading negation) is a
+// member, not the terminator.
+func scanClass(pattern string, pos int) (int, bool) {
+	idx := pos + 1
+
+	if idx < len(pattern) && (pattern[idx] == '^' || pattern[idx] == '!') {
+		idx++
+	}
+
+	if idx < len(pattern) && pattern[idx] == ']' {
+		idx++
+	}
+
+	for idx < len(pattern) {
+		switch pattern[idx] {
+		case '\\':
+			idx += 2
+		case ']':
+			return idx + 1, true
+		default:
+			idx++
+		}
+	}
+
+	return 0, false
+}
+
+// scanAlternation finds the closing brace matching the one at pos, honoring
+// nested braces, character classes, and escapes.
+func scanAlternation(pattern string, pos int) (int, bool) {
+	depth := 0
+
+	for idx := pos; idx < len(pattern); idx++ {
+		switch pattern[idx] {
+		case '\\':
+			idx++
+		case '[':
+			idx = skipClass(pattern, idx)
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return idx + 1, true
+			}
+		}
+	}
+
+	return 0, false
+}
+
+// splitAlternatives splits the inside of an alternation at top-level commas,
+// ignoring commas inside nested braces or character classes.
+func splitAlternatives(inner string) []string {
+	var (
+		result []string
+		depth  int
+		start  int
+	)
+
+	for idx := 0; idx < len(inner); idx++ {
+		switch inner[idx] {
+		case '\\':
+			idx++
+		case '[':
+			idx = skipClass(inner, idx)
+		case '{':
+			depth++
+		case '}':
+			depth--
+		case ',':
+			if depth == 0 {
+				result = append(result, inner[start:idx])
+				start = idx + 1
+			}
+		}
+	}
+
+	return append(result, inner[start:])
+}
+
+// skipClass returns the index of the last byte of the character class
+// starting at pos, or pos itself when the bracket is not a class.
+func skipClass(pattern string, pos int) int {
+	if end, ok := scanClass(pattern, pos); ok {
+		return end - 1
+	}
+
+	return pos
+}
+
+// firstGlobToken returns the index of the first glob token in pattern, or
+// -1 when the pattern is a plain literal.
+func firstGlobToken(pattern string) int {
+	for pos := 0; pos < len(pattern); {
+		end, kind := scanToken(pattern, pos)
+		if kind != tokenLiteral {
+			return pos
+		}
+
+		pos = end
+	}
+
+	return -1
+}
+
+// IsGlobPattern reports whether the path contains AppArmor glob tokens:
+// "*", "**", "?", character classes "[...]", or alternations "{a,b}".
+// Backslash-escaped characters are literals.
+func IsGlobPattern(path string) bool {
+	return firstGlobToken(path) >= 0
+}
 
 func globToRegex(pattern string) *regexp.Regexp {
 	globCacheMu.RLock()
@@ -87,48 +247,14 @@ func compileGlob(pattern string) *regexp.Regexp {
 		return neverMatchRe
 	}
 
-	var builder strings.Builder
+	budget := maxGlobAlternatives
 
-	builder.WriteString("^")
-
-	lastEnd := 0
-
-	for _, loc := range globTokenRe.FindAllStringIndex(pattern, -1) {
-		builder.WriteString(regexp.QuoteMeta(pattern[lastEnd:loc[0]]))
-
-		token := pattern[loc[0]:loc[1]]
-
-		switch token {
-		case "**":
-			builder.WriteString(`[^\000]*`)
-		case "*":
-			builder.WriteString(`[^/\000]*`)
-		case "?":
-			builder.WriteString(`[^/\000]`)
-		default:
-			inner := token[1 : len(token)-1]
-			alternatives := strings.Split(inner, ",")
-
-			if len(alternatives) > maxGlobAlternatives {
-				return neverMatchRe
-			}
-
-			for idx := range alternatives {
-				alternatives[idx] = regexp.QuoteMeta(alternatives[idx])
-			}
-
-			builder.WriteString("(")
-			builder.WriteString(strings.Join(alternatives, "|"))
-			builder.WriteString(")")
-		}
-
-		lastEnd = loc[1]
+	fragment, ok := globFragment(pattern, &budget)
+	if !ok {
+		return neverMatchRe
 	}
 
-	builder.WriteString(regexp.QuoteMeta(pattern[lastEnd:]))
-	builder.WriteString("$")
-
-	compiled, err := regexp.Compile(builder.String())
+	compiled, err := regexp.Compile("^" + fragment + "$")
 	if err != nil {
 		return neverMatchRe
 	}
@@ -136,9 +262,136 @@ func compileGlob(pattern string) *regexp.Regexp {
 	return compiled
 }
 
-// IsGlobPattern reports whether the path contains AppArmor glob tokens.
-func IsGlobPattern(path string) bool {
-	return globTokenRe.MatchString(path)
+// globFragment translates a pattern into an unanchored regex fragment. The
+// budget bounds the total number of alternatives across nested groups.
+func globFragment(pattern string, budget *int) (string, bool) {
+	var builder strings.Builder
+
+	for pos := 0; pos < len(pattern); {
+		end, kind := scanToken(pattern, pos)
+
+		fragment, ok := tokenFragment(pattern[pos:end], kind, budget)
+		if !ok {
+			return "", false
+		}
+
+		builder.WriteString(fragment)
+
+		pos = end
+	}
+
+	return builder.String(), true
+}
+
+// tokenFragment translates one token into a regex fragment. Only an
+// alternation can fail, by exhausting the budget.
+func tokenFragment(token string, kind globToken, budget *int) (string, bool) {
+	switch kind {
+	case tokenDoubleStar:
+		return `[^\000]*`, true
+	case tokenStar:
+		return `[^/\000]*`, true
+	case tokenQuestion:
+		return `[^/\000]`, true
+	case tokenClass:
+		return classFragment(token), true
+	case tokenAlternation:
+		return alternationFragment(token, budget)
+	case tokenLiteral:
+		return regexp.QuoteMeta(unescape(token)), true
+	default:
+		return regexp.QuoteMeta(token), true
+	}
+}
+
+// alternationFragment translates a "{a,b,...}" token, compiling each
+// alternative recursively.
+func alternationFragment(token string, budget *int) (string, bool) {
+	alternatives := splitAlternatives(token[1 : len(token)-1])
+
+	*budget -= len(alternatives)
+	if *budget < 0 {
+		return "", false
+	}
+
+	var builder strings.Builder
+
+	builder.WriteString("(?:")
+
+	for idx, alternative := range alternatives {
+		if idx > 0 {
+			builder.WriteByte('|')
+		}
+
+		fragment, ok := globFragment(alternative, budget)
+		if !ok {
+			return "", false
+		}
+
+		builder.WriteString(fragment)
+	}
+
+	builder.WriteByte(')')
+
+	return builder.String(), true
+}
+
+// unescape strips the backslash from an escaped literal token.
+func unescape(token string) string {
+	if len(token) == escapedLen && token[0] == '\\' {
+		return token[1:]
+	}
+
+	return token
+}
+
+// classFragment translates a "[...]" token into a regex character class.
+// Ranges ("a-z") are kept; every other member is escaped.
+func classFragment(token string) string {
+	inner := token[1 : len(token)-1]
+
+	var builder strings.Builder
+
+	builder.WriteByte('[')
+
+	if inner != "" && (inner[0] == '^' || inner[0] == '!') {
+		builder.WriteByte('^')
+
+		inner = inner[1:]
+	}
+
+	for idx := 0; idx < len(inner); idx++ {
+		if inner[idx] == '\\' && idx+1 < len(inner) {
+			idx++
+
+			// Quote rather than re-escape: "\d" must stay a literal "d".
+			builder.WriteString(regexp.QuoteMeta(string(inner[idx])))
+
+			continue
+		}
+
+		builder.WriteString(classMember(inner, idx))
+	}
+
+	builder.WriteByte(']')
+
+	return builder.String()
+}
+
+// classMember renders the class member at idx, keeping "-" as a range
+// operator between two members and escaping regex metacharacters.
+func classMember(inner string, idx int) string {
+	char := inner[idx]
+
+	if char == '-' && idx > 0 && idx+1 < len(inner) {
+		return "-"
+	}
+
+	if strings.IndexByte(`\][^-`, char) >= 0 {
+		return `\` + string(char)
+	}
+
+	return string(char)
 }
 
 type apparmorPath struct {
@@ -166,7 +419,7 @@ func newPathSet(patterns []string) pathSet {
 
 		seen[pat] = struct{}{}
 
-		if globTokenRe.MatchString(pat) {
+		if IsGlobPattern(pat) {
 			set.globs = append(set.globs, apparmorPath{
 				pattern: pat, expr: globToRegex(pat),
 			})
@@ -193,7 +446,7 @@ func (set *pathSet) matches(path string) bool {
 }
 
 func (set *pathSet) add(pattern string) {
-	if globTokenRe.MatchString(pattern) {
+	if IsGlobPattern(pattern) {
 		expr := globToRegex(pattern)
 
 		// Remove exact duplicate glob.
@@ -298,12 +551,12 @@ func intersectPaths(left, right []string) []string {
 	addMatchedLiterals(right, &leftSet, addPath)
 
 	for _, leftPath := range left {
-		if !globTokenRe.MatchString(leftPath) {
+		if !IsGlobPattern(leftPath) {
 			continue
 		}
 
 		for _, rightPath := range right {
-			if !globTokenRe.MatchString(rightPath) {
+			if !IsGlobPattern(rightPath) {
 				continue
 			}
 
@@ -320,7 +573,7 @@ func addMatchedLiterals(
 	paths []string, matcher *pathSet, addPath func(string),
 ) {
 	for _, path := range paths {
-		if !globTokenRe.MatchString(path) && matcher.matches(path) {
+		if !IsGlobPattern(path) && matcher.matches(path) {
 			addPath(path)
 		}
 	}
@@ -337,7 +590,7 @@ func buildFsEntries(perms map[string]fsPermission) []fsPathEntry {
 
 	for path, perm := range perms {
 		var expr *regexp.Regexp
-		if globTokenRe.MatchString(path) {
+		if IsGlobPattern(path) {
 			expr = globToRegex(path)
 		}
 
@@ -380,12 +633,12 @@ func matchIntersectPaths(left, right fsPathEntry) string {
 // first glob token. For example, "/var/log/**" returns "/var/log/",
 // "/var/*/foo" returns "/var/", and "**" returns "".
 func globLiteralPrefix(pattern string) string {
-	loc := globTokenRe.FindStringIndex(pattern)
-	if loc == nil {
+	first := firstGlobToken(pattern)
+	if first < 0 {
 		return pattern
 	}
 
-	prefix := pattern[:loc[0]]
+	prefix := pattern[:first]
 
 	lastSlash := strings.LastIndex(prefix, "/")
 	if lastSlash >= 0 {

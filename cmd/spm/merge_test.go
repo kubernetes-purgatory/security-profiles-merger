@@ -23,6 +23,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -329,8 +330,8 @@ func TestMergeSeccompUnionStdin(t *testing.T) {
 
 	unmarshalOutput(t, stdout, &result)
 
-	if len(result.Syscalls) != 2 {
-		t.Errorf("expected 2 syscalls, got %d", len(result.Syscalls))
+	if names := syscallNames(result.Syscalls); len(names) != 2 {
+		t.Errorf("expected 2 syscall names, got %v", names)
 	}
 }
 
@@ -422,9 +423,11 @@ func TestMergeLandlockIntersectFiles(t *testing.T) {
 		t.Errorf("expected 1 path rule, got %d", len(result.PathRules))
 	}
 
-	if len(result.PathRules[0].AccessFS) != 1 ||
-		result.PathRules[0].AccessFS[0] != landlock.FSAccessReadFile {
-		t.Errorf("expected read_file only, got %v", result.PathRules[0].AccessFS)
+	// The second profile does not handle write_file, so it never restricts
+	// it, and the first grants it: both rights survive.
+	want := []landlock.FSAccessRight{landlock.FSAccessReadFile, landlock.FSAccessWriteFile}
+	if !slices.Equal(result.PathRules[0].AccessFS, want) {
+		t.Errorf("expected %v, got %v", want, result.PathRules[0].AccessFS)
 	}
 }
 
@@ -547,8 +550,8 @@ func TestMergeAutoDetectSeccomp(t *testing.T) {
 
 	unmarshalOutput(t, stdout, &result)
 
-	if len(result.Syscalls) != 2 {
-		t.Errorf("expected 2 syscalls, got %d", len(result.Syscalls))
+	if names := syscallNames(result.Syscalls); len(names) != 2 {
+		t.Errorf("expected 2 syscall names, got %v", names)
 	}
 }
 
@@ -841,4 +844,14 @@ func TestMergeOutputHumanFormat(t *testing.T) {
 	if !strings.Contains(string(data), "Profile{") {
 		t.Errorf("expected human-readable output in file, got: %s", data)
 	}
+}
+
+func syscallNames(syscalls []specs.LinuxSyscall) []string {
+	var names []string
+
+	for _, sc := range syscalls {
+		names = append(names, sc.Names...)
+	}
+
+	return names
 }

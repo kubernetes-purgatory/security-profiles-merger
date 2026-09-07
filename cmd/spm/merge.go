@@ -33,7 +33,8 @@ import (
 
 const mergeUsage = `Usage: spm merge [options] [files...]
 
-Merge two or more security profiles using the given strategy.
+Merge one or more security profiles using the given strategy.
+A single profile is normalized without merging.
 Reads from stdin (as a JSON array) when no files are provided.
 
 Options:

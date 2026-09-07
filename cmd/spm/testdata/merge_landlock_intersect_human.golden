@@ -1,1 +1,1 @@
-Profile{fs:execute,read_file,write_file /tmp(execute) /var(read_file)}
+Profile{fs:execute,read_file,write_file /tmp(execute) /var(execute,read_file)}

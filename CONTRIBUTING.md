@@ -34,7 +34,8 @@ The codebase is organized in three layers:
   `FormatProfile`. Each package defines its own types (seccomp uses OCI
   runtime-spec types, apparmor and landlock define their own) and implements
   profile-specific normalization, deduplication, and merge logic on top of
-  `internal/merge/`.
+  `internal/merge/`. The seccomp package merges syscalls through a clause
+  model (`rules.go`, `args.go`) that reasons about argument filter regions.
 - `cmd/spm/` is a thin CLI layer that wires the packages together using Go
   generics. It uses the standard library `flag` package with manual subcommand
   dispatch.

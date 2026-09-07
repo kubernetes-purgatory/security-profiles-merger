@@ -63,7 +63,7 @@ fuzz: ## Run all fuzz tests (use FUZZTIME to adjust, default 30s)
 	@for pkg in $(PACKAGES); do \
 		for target in $$($(GO) test -list 'Fuzz.*' $$pkg 2>/dev/null | grep '^Fuzz'); do \
 			echo "fuzzing $$pkg $$target"; \
-			$(GO) test -fuzz=$$target -fuzztime=$(FUZZTIME) $$pkg || exit 1; \
+			$(GO) test -fuzz="^$$target\$$" -fuzztime=$(FUZZTIME) $$pkg || exit 1; \
 		done; \
 	done
 
@@ -94,7 +94,7 @@ lint: $(GOLANGCI_LINT) ## Run golangci-lint
 
 $(GOLANGCI_LINT):
 	@mkdir -p $(BUILD_DIR)
-	curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/HEAD/install.sh | sh -s -- -b $(BUILD_DIR) v$(GOLANGCI_LINT_VERSION)
+	curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/v$(GOLANGCI_LINT_VERSION)/install.sh | sh -s -- -b $(BUILD_DIR) v$(GOLANGCI_LINT_VERSION)
 
 MDOCS := README.md docs/api.md
 

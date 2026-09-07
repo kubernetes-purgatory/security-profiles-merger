@@ -3,18 +3,8 @@
   "syscalls": [
     {
       "names": [
-        "close"
-      ],
-      "action": "SCMP_ACT_ALLOW"
-    },
-    {
-      "names": [
-        "read"
-      ],
-      "action": "SCMP_ACT_ALLOW"
-    },
-    {
-      "names": [
+        "close",
+        "read",
         "write"
       ],
       "action": "SCMP_ACT_ALLOW"
