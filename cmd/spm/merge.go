@@ -26,9 +26,9 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/saschagrunert/security-profiles-merger/apparmor"
-	"github.com/saschagrunert/security-profiles-merger/landlock"
-	"github.com/saschagrunert/security-profiles-merger/seccomp"
+	"sigs.k8s.io/security-profiles-merger/apparmor"
+	"sigs.k8s.io/security-profiles-merger/landlock"
+	"sigs.k8s.io/security-profiles-merger/seccomp"
 )
 
 const mergeUsage = `Usage: spm merge [options] [files...]

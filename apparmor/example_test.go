@@ -19,7 +19,7 @@ package apparmor_test
 import (
 	"fmt"
 
-	"github.com/saschagrunert/security-profiles-merger/apparmor"
+	"sigs.k8s.io/security-profiles-merger/apparmor"
 )
 
 func ExampleIntersect() {

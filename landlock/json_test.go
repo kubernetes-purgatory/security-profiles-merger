@@ -21,7 +21,7 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/saschagrunert/security-profiles-merger/landlock"
+	"sigs.k8s.io/security-profiles-merger/landlock"
 )
 
 func TestJSONRoundTripFull(t *testing.T) {

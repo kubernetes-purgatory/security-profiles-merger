@@ -21,7 +21,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/saschagrunert/security-profiles-merger/internal/merge"
+	"sigs.k8s.io/security-profiles-merger/internal/merge"
 )
 
 var (

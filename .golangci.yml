@@ -124,7 +124,7 @@ linters:
           allow:
             - $gostd
             - github.com/opencontainers/runtime-spec
-            - github.com/saschagrunert/security-profiles-merger
+            - sigs.k8s.io/security-profiles-merger
     exhaustruct_v5:
       ignore-patterns:
         - 'github\.com/opencontainers/runtime-spec/specs-go\..*'

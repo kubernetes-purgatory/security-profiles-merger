@@ -20,7 +20,7 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/saschagrunert/security-profiles-merger/apparmor"
+	"sigs.k8s.io/security-profiles-merger/apparmor"
 )
 
 func buildAppArmorProfile(numPaths int) *apparmor.Profile {

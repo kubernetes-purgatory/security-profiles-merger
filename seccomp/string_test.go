@@ -21,7 +21,7 @@ import (
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 
-	"github.com/saschagrunert/security-profiles-merger/seccomp"
+	"sigs.k8s.io/security-profiles-merger/seccomp"
 )
 
 func TestFormatProfile(t *testing.T) {

@@ -23,7 +23,7 @@ import (
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 
-	"github.com/saschagrunert/security-profiles-merger/seccomp"
+	"sigs.k8s.io/security-profiles-merger/seccomp"
 )
 
 // This file holds an independent evaluator for seccomp profiles and fuzz
