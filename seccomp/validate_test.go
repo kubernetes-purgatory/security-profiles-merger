@@ -534,3 +534,240 @@ func TestValidateStrictAllKnownOperators(t *testing.T) {
 		})
 	}
 }
+
+func TestValidateArtifactNil(t *testing.T) {
+	t.Parallel()
+
+	err := seccomp.ValidateArtifact(nil)
+	if !errors.Is(err, seccomp.ErrNilProfile) {
+		t.Fatalf("expected ErrNilProfile, got: %v", err)
+	}
+}
+
+func TestValidateArtifactValid(t *testing.T) {
+	t.Parallel()
+
+	profile := &specs.LinuxSeccomp{
+		DefaultAction: specs.ActErrno,
+		Architectures: []specs.Arch{specs.ArchX86_64, specs.ArchX86},
+		Flags:         []specs.LinuxSeccompFlag{specs.LinuxSeccompFlagLog},
+		Syscalls: []specs.LinuxSyscall{
+			{Names: []string{syscallRead}, Action: specs.ActAllow},
+			{Names: []string{syscallWrite}, Action: specs.ActTrace},
+		},
+	}
+
+	err := seccomp.ValidateArtifact(profile)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestValidateArtifactAllowsDuplicateSyscallNames(t *testing.T) {
+	t.Parallel()
+
+	// The OCI runtime-spec allows one syscall in several entries with
+	// different argument filters, so artifacts may use that shape.
+	profile := &specs.LinuxSeccomp{
+		DefaultAction: specs.ActErrno,
+		Syscalls: []specs.LinuxSyscall{
+			{
+				Names:  []string{syscallWrite},
+				Action: specs.ActAllow,
+				Args: []specs.LinuxSeccompArg{
+					{Index: 0, Value: 1, Op: specs.OpEqualTo},
+				},
+			},
+			{
+				Names:  []string{syscallWrite},
+				Action: specs.ActAllow,
+				Args: []specs.LinuxSeccompArg{
+					{Index: 0, Value: 2, Op: specs.OpEqualTo},
+				},
+			},
+		},
+	}
+
+	err := seccomp.ValidateArtifact(profile)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	err = seccomp.ValidateStrict(profile)
+	if !errors.Is(err, seccomp.ErrDuplicateSyscallName) {
+		t.Fatalf("expected ValidateStrict to reject duplicates, got: %v", err)
+	}
+}
+
+func TestValidateArtifactRejectsNotifyDefaultAction(t *testing.T) {
+	t.Parallel()
+
+	profile := &specs.LinuxSeccomp{
+		DefaultAction: specs.ActNotify,
+	}
+
+	err := seccomp.ValidateArtifact(profile)
+	if !errors.Is(err, seccomp.ErrNotifyNotAllowed) {
+		t.Fatalf("expected ErrNotifyNotAllowed, got: %v", err)
+	}
+
+	if !strings.Contains(err.Error(), "default action") {
+		t.Errorf("error should mention default action: %v", err)
+	}
+
+	err = seccomp.ValidateStrict(profile)
+	if err != nil {
+		t.Errorf("ValidateStrict should accept SCMP_ACT_NOTIFY: %v", err)
+	}
+}
+
+func TestValidateArtifactRejectsNotifySyscall(t *testing.T) {
+	t.Parallel()
+
+	profile := &specs.LinuxSeccomp{
+		DefaultAction: specs.ActErrno,
+		Syscalls: []specs.LinuxSyscall{
+			{Names: []string{syscallRead}, Action: specs.ActAllow},
+			{Names: []string{syscallWrite}, Action: specs.ActNotify},
+		},
+	}
+
+	err := seccomp.ValidateArtifact(profile)
+	if !errors.Is(err, seccomp.ErrNotifyNotAllowed) {
+		t.Fatalf("expected ErrNotifyNotAllowed, got: %v", err)
+	}
+
+	if !strings.Contains(err.Error(), "syscall entry 1") {
+		t.Errorf("error should mention syscall entry 1: %v", err)
+	}
+}
+
+func TestValidateArtifactRejectsListener(t *testing.T) {
+	t.Parallel()
+
+	profile := &specs.LinuxSeccomp{
+		DefaultAction:    specs.ActErrno,
+		ListenerPath:     "/run/seccomp-agent.sock",
+		ListenerMetadata: "opaque",
+	}
+
+	err := seccomp.ValidateArtifact(profile)
+	if !errors.Is(err, seccomp.ErrListenerNotAllowed) {
+		t.Fatalf("expected ErrListenerNotAllowed, got: %v", err)
+	}
+
+	msg := err.Error()
+	for _, field := range []string{"listenerPath", "listenerMetadata"} {
+		if !strings.Contains(msg, field) {
+			t.Errorf("error should mention %s: %v", field, err)
+		}
+	}
+
+	err = seccomp.ValidateStrict(profile)
+	if err != nil {
+		t.Errorf("ValidateStrict should accept listener settings: %v", err)
+	}
+}
+
+func TestValidateArtifactRunsShapeChecks(t *testing.T) {
+	t.Parallel()
+
+	profile := &specs.LinuxSeccomp{
+		DefaultAction: specs.ActErrno,
+		Architectures: []specs.Arch{"SCMP_ARCH_BOGUS"},
+		Flags:         []specs.LinuxSeccompFlag{"SECCOMP_FILTER_FLAG_BOGUS"},
+		Syscalls: []specs.LinuxSyscall{
+			{
+				Names:  []string{syscallRead},
+				Action: specs.ActAllow,
+				Args: []specs.LinuxSeccompArg{
+					{Index: 7, Value: 0, Op: "SCMP_CMP_BOGUS"},
+				},
+			},
+		},
+	}
+
+	err := seccomp.ValidateArtifact(profile)
+	if err == nil {
+		t.Fatal("expected error for invalid profile shape")
+	}
+
+	for _, want := range []error{
+		seccomp.ErrUnknownArch,
+		seccomp.ErrUnknownFlag,
+		seccomp.ErrUnknownOperator,
+		seccomp.ErrArgIndexOutOfRange,
+	} {
+		if !errors.Is(err, want) {
+			t.Errorf("expected %v in: %v", want, err)
+		}
+	}
+}
+
+func TestValidateArtifactCollectsAllErrors(t *testing.T) {
+	t.Parallel()
+
+	profile := &specs.LinuxSeccomp{
+		DefaultAction: actInvalid,
+		ListenerPath:  "/run/seccomp-agent.sock",
+		Syscalls: []specs.LinuxSyscall{
+			{Names: []string{syscallRead}, Action: specs.ActNotify},
+		},
+	}
+
+	err := seccomp.ValidateArtifact(profile)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+
+	for _, want := range []error{
+		seccomp.ErrUnknownAction,
+		seccomp.ErrNotifyNotAllowed,
+		seccomp.ErrListenerNotAllowed,
+	} {
+		if !errors.Is(err, want) {
+			t.Errorf("expected %v in: %v", want, err)
+		}
+	}
+}
+
+func TestValidateArtifactEntryCount(t *testing.T) {
+	t.Parallel()
+
+	entries := make([]specs.LinuxSyscall, 0, seccomp.MaxArtifactEntriesPerSyscall+1)
+	for idx := range seccomp.MaxArtifactEntriesPerSyscall + 1 {
+		entries = append(entries, specs.LinuxSyscall{
+			Names:  []string{syscallWrite},
+			Action: specs.ActAllow,
+			Args: []specs.LinuxSeccompArg{
+				{Index: 0, Value: uint64(idx), Op: specs.OpEqualTo},
+			},
+		})
+	}
+
+	over := &specs.LinuxSeccomp{DefaultAction: specs.ActErrno, Syscalls: entries}
+
+	err := seccomp.ValidateArtifact(over)
+	if !errors.Is(err, seccomp.ErrTooManyEntries) {
+		t.Fatalf("expected ErrTooManyEntries, got: %v", err)
+	}
+
+	if !strings.Contains(err.Error(), syscallWrite) {
+		t.Errorf("error should name the syscall: %v", err)
+	}
+
+	err = seccomp.ValidateStrict(over)
+	if !errors.Is(err, seccomp.ErrDuplicateSyscallName) {
+		t.Errorf("ValidateStrict should only report duplicates: %v", err)
+	}
+
+	atLimit := &specs.LinuxSeccomp{
+		DefaultAction: specs.ActErrno,
+		Syscalls:      entries[:seccomp.MaxArtifactEntriesPerSyscall],
+	}
+
+	err = seccomp.ValidateArtifact(atLimit)
+	if err != nil {
+		t.Fatalf("profile at the limit should validate: %v", err)
+	}
+}

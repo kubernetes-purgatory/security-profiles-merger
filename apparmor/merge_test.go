@@ -128,6 +128,91 @@ func TestIntersectSingleProfile(t *testing.T) {
 	}
 }
 
+func TestIntersectIdenticalProfiles(t *testing.T) {
+	t.Parallel()
+
+	profile := &apparmor.Profile{
+		Executable: &apparmor.ExecutableRules{
+			AllowedExecutables: []string{pathBinBash},
+			AllowedLibraries:   []string{pathLibC},
+		},
+		Filesystem: &apparmor.FilesystemRules{
+			ReadOnlyPaths:  []string{pathEtcConfig},
+			WriteOnlyPaths: []string{pathVarLog},
+			ReadWritePaths: nil,
+		},
+		Network: &apparmor.NetworkRules{
+			AllowRaw: boolPtr(true),
+			Protocols: &apparmor.AllowedProtocols{
+				AllowTCP: boolPtr(true),
+				AllowUDP: boolPtr(false),
+			},
+		},
+		Capabilities: &apparmor.CapabilityRules{
+			AllowedCapabilities: []string{capNetAdmin, capSysTime},
+		},
+	}
+
+	clone := &apparmor.Profile{
+		Executable: &apparmor.ExecutableRules{
+			AllowedExecutables: []string{pathBinBash},
+			AllowedLibraries:   []string{pathLibC},
+		},
+		Filesystem: &apparmor.FilesystemRules{
+			ReadOnlyPaths:  []string{pathEtcConfig},
+			WriteOnlyPaths: []string{pathVarLog},
+			ReadWritePaths: nil,
+		},
+		Network: &apparmor.NetworkRules{
+			AllowRaw: boolPtr(true),
+			Protocols: &apparmor.AllowedProtocols{
+				AllowTCP: boolPtr(true),
+				AllowUDP: boolPtr(false),
+			},
+		},
+		Capabilities: &apparmor.CapabilityRules{
+			AllowedCapabilities: []string{capNetAdmin, capSysTime},
+		},
+	}
+
+	result, err := apparmor.Intersect(profile, clone)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if !reflect.DeepEqual(result.Executable, profile.Executable) {
+		t.Errorf("executable = %v, want %v", result.Executable, profile.Executable)
+	}
+
+	if !slices.Equal(result.Filesystem.ReadOnlyPaths, profile.Filesystem.ReadOnlyPaths) {
+		t.Errorf("ReadOnlyPaths = %v, want %v",
+			result.Filesystem.ReadOnlyPaths, profile.Filesystem.ReadOnlyPaths)
+	}
+
+	if !slices.Equal(result.Filesystem.WriteOnlyPaths, profile.Filesystem.WriteOnlyPaths) {
+		t.Errorf("WriteOnlyPaths = %v, want %v",
+			result.Filesystem.WriteOnlyPaths, profile.Filesystem.WriteOnlyPaths)
+	}
+
+	if !*result.Network.AllowRaw {
+		t.Error("AllowRaw should be true")
+	}
+
+	if !*result.Network.Protocols.AllowTCP {
+		t.Error("AllowTCP should be true")
+	}
+
+	if *result.Network.Protocols.AllowUDP {
+		t.Error("AllowUDP should be false")
+	}
+
+	want := []string{capNetAdmin, capSysTime}
+	if !slices.Equal(result.Capabilities.AllowedCapabilities, want) {
+		t.Errorf("capabilities = %v, want %v",
+			result.Capabilities.AllowedCapabilities, want)
+	}
+}
+
 func TestIntersectCapabilities(t *testing.T) {
 	t.Parallel()
 

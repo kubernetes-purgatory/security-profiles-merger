@@ -31,7 +31,8 @@ The codebase is organized in three layers:
   packages build on these primitives.
 - `seccomp/`, `apparmor/`, `landlock/` each expose the same public API surface:
   `Intersect`, `Union`, `Validate`, `ValidateStrict`, `Diff`, `FormatDiff`, and
-  `FormatProfile`. Each package defines its own types (seccomp uses OCI
+  `FormatProfile` (seccomp additionally exposes `ValidateArtifact` for
+  untrusted OCI artifact input). Each package defines its own types (seccomp uses OCI
   runtime-spec types, apparmor and landlock define their own) and implements
   profile-specific normalization, deduplication, and merge logic on top of
   `internal/merge/`. The seccomp package merges syscalls through a clause

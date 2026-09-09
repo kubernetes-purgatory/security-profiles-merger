@@ -17,6 +17,7 @@ limitations under the License.
 package seccomp_test
 
 import (
+	"encoding/json"
 	"fmt"
 	"testing"
 
@@ -277,6 +278,147 @@ func BenchmarkIntersectDisjoint(b *testing.B) {
 		}
 
 		b.Run(fmt.Sprintf("syscalls=%d", numSyscalls), func(b *testing.B) {
+			for range b.N {
+				result, err := seccomp.Intersect(left, right)
+				if err != nil {
+					b.Fatal(err)
+				}
+
+				_ = result
+			}
+		})
+	}
+}
+
+// artifactSizeLimit is the artifact size that KEP-6061 recommends runtimes
+// enforce, which bounds the largest profile a merge has to handle.
+const artifactSizeLimit = 1 << 20
+
+// buildArtifactSizedProfile grows a profile with distinct, argument-filtered
+// syscalls until its JSON encoding reaches artifactSizeLimit.
+func buildArtifactSizedProfile(tb testing.TB) *specs.LinuxSeccomp {
+	tb.Helper()
+
+	const approxBytesPerEntry = 140
+
+	num := artifactSizeLimit / approxBytesPerEntry
+
+	for {
+		profile := buildProfileWithArgs(num)
+
+		data, err := json.Marshal(profile)
+		if err != nil {
+			tb.Fatal(err)
+		}
+
+		if len(data) >= artifactSizeLimit {
+			return profile
+		}
+
+		num += num/10 + 1
+	}
+}
+
+// buildContestedProfile puts numEntries argument-filtered entries on a single
+// syscall, the shape that makes the clause merge do the most work per name.
+func buildContestedProfile(
+	numEntries int, operator specs.LinuxSeccompOperator,
+) *specs.LinuxSeccomp {
+	syscalls := make([]specs.LinuxSyscall, 0, numEntries)
+
+	for idx := range numEntries {
+		syscalls = append(syscalls, specs.LinuxSyscall{
+			Names:  []string{"ioctl"},
+			Action: specs.ActAllow,
+			Args: []specs.LinuxSeccompArg{
+				{Index: 1, Value: uint64(idx), Op: operator},
+			},
+		})
+	}
+
+	return &specs.LinuxSeccomp{
+		DefaultAction: specs.ActErrno,
+		Syscalls:      syscalls,
+	}
+}
+
+func TestProfileOfSizeReachesArtifactLimit(t *testing.T) {
+	t.Parallel()
+
+	profile := buildArtifactSizedProfile(t)
+
+	data, err := json.Marshal(profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(data) < artifactSizeLimit {
+		t.Fatalf("profile is %d bytes, want at least %d",
+			len(data), artifactSizeLimit)
+	}
+
+	err = seccomp.ValidateArtifact(profile)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestIntersectArtifactSizeLimit(t *testing.T) {
+	t.Parallel()
+
+	baseline := buildProfile(400)
+	artifact := buildArtifactSizedProfile(t)
+
+	result, err := seccomp.Intersect(baseline, artifact)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	err = seccomp.Validate(result)
+	if err != nil {
+		t.Fatalf("merged profile is invalid: %v", err)
+	}
+}
+
+func BenchmarkIntersectArtifactSizeLimit(b *testing.B) {
+	baseline := buildProfile(400)
+	artifact := buildArtifactSizedProfile(b)
+
+	b.ResetTimer()
+
+	for range b.N {
+		result, err := seccomp.Intersect(baseline, artifact)
+		if err != nil {
+			b.Fatal(err)
+		}
+
+		_ = result
+	}
+}
+
+func BenchmarkValidateArtifactSizeLimit(b *testing.B) {
+	profile := buildArtifactSizedProfile(b)
+
+	b.ResetTimer()
+
+	for range b.N {
+		err := seccomp.ValidateArtifact(profile)
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkIntersectContested measures the quadratic case that
+// MaxArtifactEntriesPerSyscall bounds: the largest size is the cap itself.
+func BenchmarkIntersectContested(b *testing.B) {
+	for _, numEntries := range []int{
+		16, seccomp.MaxArtifactEntriesPerSyscall,
+	} {
+		left := buildContestedProfile(numEntries, specs.OpEqualTo)
+		right := buildContestedProfile(numEntries, specs.OpNotEqual)
+
+		b.Run(fmt.Sprintf("entries=%d", numEntries), func(b *testing.B) {
 			for range b.N {
 				result, err := seccomp.Intersect(left, right)
 				if err != nil {

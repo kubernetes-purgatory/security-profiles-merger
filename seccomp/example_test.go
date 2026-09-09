@@ -232,6 +232,29 @@ func ExampleFormatDiff() {
 	// Diff{-write->SCMP_ACT_ALLOW +open->SCMP_ACT_ALLOW}
 }
 
+func ExampleDiffSyscalls() {
+	diff := seccomp.DiffSyscalls(
+		[]specs.LinuxSyscall{
+			{Names: []string{syscallRead, syscallWrite}, Action: specs.ActAllow},
+		},
+		[]specs.LinuxSyscall{
+			{Names: []string{syscallRead, syscallOpen}, Action: specs.ActAllow},
+		},
+	)
+
+	for _, r := range diff.Removed {
+		fmt.Println("Removed:", r.Name)
+	}
+
+	for _, a := range diff.Added {
+		fmt.Println("Added:", a.Name)
+	}
+
+	// Output:
+	// Removed: write
+	// Added: open
+}
+
 func ExampleUnion() {
 	recording1 := &specs.LinuxSeccomp{
 		DefaultAction: specs.ActErrno,
@@ -261,4 +284,22 @@ func ExampleUnion() {
 	// Output:
 	// Default: SCMP_ACT_ERRNO
 	// Syscall: read,write -> SCMP_ACT_ALLOW
+}
+
+func ExampleValidateArtifact() {
+	profile := &specs.LinuxSeccomp{
+		DefaultAction: specs.ActErrno,
+		ListenerPath:  "/run/seccomp-agent.sock",
+		Syscalls: []specs.LinuxSyscall{
+			{Names: []string{syscallRead}, Action: specs.ActAllow},
+			{Names: []string{"mkdir"}, Action: specs.ActNotify},
+		},
+	}
+
+	err := seccomp.ValidateArtifact(profile)
+	fmt.Println(err)
+
+	// Output:
+	// syscall entry 1 action: SCMP_ACT_NOTIFY is not allowed
+	// listenerPath: listener settings are not allowed
 }

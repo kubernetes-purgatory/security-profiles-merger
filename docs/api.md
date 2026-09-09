@@ -47,6 +47,7 @@ import "sigs.k8s.io/security-profiles-merger/seccomp"
 | `LessRestrictive` | Return the less restrictive of two seccomp actions |
 | `Validate` | Check for known actions and non-empty syscall names |
 | `ValidateStrict` | All Validate checks plus duplicates, unknown archs/flags/operators |
+| `ValidateArtifact` | Validate plus shape checks for untrusted OCI artifacts; rejects `SCMP_ACT_NOTIFY`, listener settings, and more than `MaxArtifactEntriesPerSyscall` entries per syscall; allows duplicates |
 | `FormatProfile` | Human-readable representation of a seccomp profile |
 | `Diff` | Structured diff between two profiles |
 | `FormatDiff` | Human-readable representation of a profile diff |

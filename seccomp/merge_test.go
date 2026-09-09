@@ -816,6 +816,37 @@ func TestUnionErrnoRet(t *testing.T) {
 	}
 }
 
+func TestUnionSyscallErrnoRetTiebreak(t *testing.T) {
+	t.Parallel()
+
+	left := &specs.LinuxSeccomp{
+		DefaultAction: specs.ActAllow,
+		Syscalls: []specs.LinuxSyscall{
+			{Names: []string{syscallRead}, Action: specs.ActErrno, ErrnoRet: uintPtr(1)},
+		},
+	}
+
+	right := &specs.LinuxSeccomp{
+		DefaultAction: specs.ActAllow,
+		Syscalls: []specs.LinuxSyscall{
+			{Names: []string{syscallRead}, Action: specs.ActErrno, ErrnoRet: uintPtr(22)},
+		},
+	}
+
+	result, err := seccomp.Union(left, right)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(result.Syscalls) != 1 {
+		t.Fatalf("expected 1 syscall, got %d", len(result.Syscalls))
+	}
+
+	if result.Syscalls[0].ErrnoRet == nil || *result.Syscalls[0].ErrnoRet != 1 {
+		t.Errorf("ErrnoRet = %v, want 1 (leftmost wins)", result.Syscalls[0].ErrnoRet)
+	}
+}
+
 func TestErrnoRetNil(t *testing.T) {
 	t.Parallel()
 
@@ -2623,6 +2654,29 @@ func TestIntersectGroupsEqualEntries(t *testing.T) {
 	want := "Profile{default:SCMP_ACT_ERRNO open->SCMP_ACT_LOG read,write->SCMP_ACT_ALLOW}"
 	if got := seccomp.FormatProfile(result); got != want {
 		t.Errorf("got %s, want %s", got, want)
+	}
+}
+
+func TestIntersectArchitecturesDisjoint(t *testing.T) {
+	t.Parallel()
+
+	left := &specs.LinuxSeccomp{
+		DefaultAction: specs.ActErrno,
+		Architectures: []specs.Arch{specs.ArchX86_64},
+	}
+
+	right := &specs.LinuxSeccomp{
+		DefaultAction: specs.ActErrno,
+		Architectures: []specs.Arch{specs.ArchAARCH64},
+	}
+
+	result, err := seccomp.Intersect(left, right)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(result.Architectures) != 0 {
+		t.Errorf("architectures = %v, want empty", result.Architectures)
 	}
 }
 
