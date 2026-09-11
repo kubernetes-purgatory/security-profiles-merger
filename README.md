@@ -92,7 +92,9 @@ for _, profile := range []*specs.LinuxSeccomp{nodeBaseline, podBaseProfile, ociP
 
 // Inputs go from most to least trusted: the runtime baseline, the optional
 // pod-spec base profile, then the artifact. Tie-breaks such as errno values
-// favor the earlier input.
+// favor the earlier input. ErrDisjointArchitectures means the artifact was
+// built for another architecture: report it as a permanent rejection, like
+// a ValidateArtifact failure.
 effective, err := seccomp.Intersect(nodeBaseline, podBaseProfile, ociPulledProfile)
 if err != nil {
     return err
@@ -224,7 +226,11 @@ spm validate --type seccomp --artifact pulled-profile.json
 ```
 
 `--artifact` runs the checks container runtimes apply to a KEP-6061 artifact
-(seccomp only).
+(seccomp only). It cannot be combined with `--strict`.
+
+A field the profile type does not know, such as a misspelled key, would
+silently drop the rule it was meant to carry. All commands warn about such
+fields on stderr, and `validate --strict` rejects them.
 
 Profiles can also be read from stdin:
 

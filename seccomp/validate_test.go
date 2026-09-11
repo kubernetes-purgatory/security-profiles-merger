@@ -956,3 +956,171 @@ func TestValidateArtifactRejectsListenerFlag(t *testing.T) {
 		t.Errorf("ValidateStrict should accept the listener flag: %v", err)
 	}
 }
+
+func TestValidateStrictUnusedErrnoRet(t *testing.T) {
+	t.Parallel()
+
+	errno := uint(13)
+	unused := &specs.LinuxSeccomp{
+		DefaultAction:   specs.ActAllow,
+		DefaultErrnoRet: &errno,
+		Syscalls: []specs.LinuxSyscall{
+			{Names: []string{syscallWrite}, Action: specs.ActLog, ErrnoRet: &errno},
+		},
+	}
+
+	err := seccomp.ValidateStrict(unused)
+	if !errors.Is(err, seccomp.ErrUnusedErrnoRet) {
+		t.Fatalf("expected ErrUnusedErrnoRet, got: %v", err)
+	}
+
+	for _, want := range []string{"defaultErrnoRet", "syscall entry 0 errnoRet"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q should mention %q", err, want)
+		}
+	}
+
+	err = seccomp.ValidateArtifact(unused)
+	if err != nil {
+		t.Errorf("ValidateArtifact should ignore an unused errnoRet: %v", err)
+	}
+
+	used := &specs.LinuxSeccomp{
+		DefaultAction:   specs.ActErrno,
+		DefaultErrnoRet: &errno,
+		Syscalls: []specs.LinuxSyscall{
+			{Names: []string{syscallWrite}, Action: specs.ActTrace, ErrnoRet: &errno},
+		},
+	}
+
+	err = seccomp.ValidateStrict(used)
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestValidateArtifactConflictingEntries(t *testing.T) {
+	t.Parallel()
+
+	argOne := specs.LinuxSeccompArg{Index: 0, Value: 1, Op: specs.OpEqualTo}
+	argTwo := specs.LinuxSeccompArg{Index: 0, Value: 2, Op: specs.OpEqualTo}
+	eperm, eacces, einval := uint(1), uint(13), uint(22)
+
+	entry := func(
+		action specs.LinuxSeccompAction, errno *uint, args ...specs.LinuxSeccompArg,
+	) specs.LinuxSyscall {
+		return specs.LinuxSyscall{
+			Names: []string{syscallRead}, Action: action, ErrnoRet: errno, Args: args,
+		}
+	}
+
+	for _, testCase := range []struct {
+		name     string
+		def      specs.LinuxSeccompAction
+		entries  []specs.LinuxSyscall
+		conflict bool
+	}{
+		{
+			name: "unconditional actions differ",
+			def:  specs.ActErrno,
+			entries: []specs.LinuxSyscall{
+				entry(specs.ActAllow, nil), entry(specs.ActLog, nil),
+			},
+			conflict: true,
+		},
+		{
+			name: "same filter different actions",
+			def:  specs.ActErrno,
+			entries: []specs.LinuxSyscall{
+				entry(specs.ActAllow, nil, argOne), entry(specs.ActLog, nil, argOne),
+			},
+			conflict: true,
+		},
+		{
+			name: "same filter different errno",
+			def:  specs.ActAllow,
+			entries: []specs.LinuxSyscall{
+				entry(specs.ActErrno, &eacces, argOne), entry(specs.ActErrno, &einval, argOne),
+			},
+			conflict: true,
+		},
+		{
+			name: "repeated index counts per condition",
+			def:  specs.ActErrno,
+			entries: []specs.LinuxSyscall{
+				entry(specs.ActAllow, nil, argOne, argTwo), entry(specs.ActLog, nil, argTwo),
+			},
+			conflict: true,
+		},
+		{
+			name: "duplicates with the same result",
+			def:  specs.ActErrno,
+			entries: []specs.LinuxSyscall{
+				entry(specs.ActAllow, nil), entry(specs.ActAllow, nil),
+			},
+			conflict: false,
+		},
+		{
+			name: "EPERM spelled differently",
+			def:  specs.ActAllow,
+			entries: []specs.LinuxSyscall{
+				entry(specs.ActErrno, nil, argOne), entry(specs.ActErrno, &eperm, argOne),
+			},
+			conflict: false,
+		},
+		{
+			name: "entry equal to the default is skipped",
+			def:  specs.ActAllow,
+			entries: []specs.LinuxSyscall{
+				entry(specs.ActAllow, nil), entry(specs.ActLog, nil),
+			},
+			conflict: false,
+		},
+		{
+			name: "unconditional next to conditional",
+			def:  specs.ActErrno,
+			entries: []specs.LinuxSyscall{
+				entry(specs.ActAllow, nil), entry(specs.ActLog, nil, argOne),
+			},
+			conflict: false,
+		},
+		{
+			name: "different filters",
+			def:  specs.ActErrno,
+			entries: []specs.LinuxSyscall{
+				entry(specs.ActAllow, nil, argOne), entry(specs.ActLog, nil, argTwo),
+			},
+			conflict: false,
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			profile := &specs.LinuxSeccomp{
+				DefaultAction: testCase.def,
+				Syscalls:      testCase.entries,
+			}
+
+			err := seccomp.ValidateArtifact(profile)
+
+			if got := errors.Is(err, seccomp.ErrConflictingEntries); got != testCase.conflict {
+				t.Fatalf("conflict = %v, want %v (err: %v)", got, testCase.conflict, err)
+			}
+
+			if !testCase.conflict {
+				return
+			}
+
+			want := `syscall entry 1: conflicting entries for "read"`
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("error %q should contain %q", err, want)
+			}
+
+			// Validate does not run this check.
+			err = seccomp.Validate(profile)
+			if err != nil {
+				t.Errorf("Validate should accept conflicting entries: %v", err)
+			}
+		})
+	}
+}

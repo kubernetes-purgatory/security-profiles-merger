@@ -21,7 +21,6 @@ import (
 	"cmp"
 	"fmt"
 	"maps"
-	"path/filepath"
 	"slices"
 	"strings"
 
@@ -74,10 +73,10 @@ type strategy interface {
 }
 
 func foldProfiles(profiles []*Profile, mergeOp strategy) (*Profile, error) {
-	for _, profile := range profiles {
+	for idx, profile := range profiles {
 		err := validateEmptyPathsBeforeNormalize(profile)
 		if err != nil {
-			return nil, fmt.Errorf("validate: %w", err)
+			return nil, fmt.Errorf("validate profile %d: %w", idx, err)
 		}
 	}
 
@@ -90,10 +89,10 @@ func foldProfiles(profiles []*Profile, mergeOp strategy) (*Profile, error) {
 		deduplicateHandledAccess(normalized[idx])
 	}
 
-	for _, profile := range normalized {
+	for idx, profile := range normalized {
 		err := Validate(profile)
 		if err != nil {
-			return nil, fmt.Errorf("validate: %w", err)
+			return nil, fmt.Errorf("validate profile %d: %w", idx, err)
 		}
 	}
 
@@ -101,7 +100,7 @@ func foldProfiles(profiles []*Profile, mergeOp strategy) (*Profile, error) {
 		return mergeTwo(a, b, mergeOp), nil
 	})
 	if err != nil {
-		return nil, fmt.Errorf("fold: %w", err)
+		return nil, fmt.Errorf("merge: %w", err)
 	}
 
 	pruneUnhandledRights(result)
@@ -561,7 +560,7 @@ func normalizeProfile(profile *Profile) *Profile {
 	clone := cloneProfile(profile)
 
 	for idx := range clone.PathRules {
-		clone.PathRules[idx].Path = filepath.Clean(clone.PathRules[idx].Path)
+		clone.PathRules[idx].Path = merge.CleanPath(clone.PathRules[idx].Path)
 	}
 
 	return clone

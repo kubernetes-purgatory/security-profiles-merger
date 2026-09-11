@@ -1,5 +1,6 @@
 GO ?= go
 FUZZTIME ?= 30s
+RACE ?= -race
 
 GOLANGCI_LINT_VERSION = 2.13.2
 GOVULNCHECK_VERSION = v1.7.0
@@ -53,9 +54,9 @@ build: ## Build the spm binary (static)
 ##@ Development
 
 .PHONY: test
-test: ## Run tests with race detection and coverage report
+test: ## Run tests with race detection and coverage report (set RACE= to skip the race detector, which needs cgo)
 	@mkdir -p $(BUILD_DIR)
-	$(GO) test -v -race -count=1 -coverprofile=$(BUILD_DIR)/coverage.out -covermode=atomic -coverpkg=./... ./...
+	$(GO) test -v $(RACE) -count=1 -coverprofile=$(BUILD_DIR)/coverage.out -covermode=atomic -coverpkg=./... ./...
 	$(GO) tool cover -html=$(BUILD_DIR)/coverage.out -o $(BUILD_DIR)/coverage.html
 
 .PHONY: fuzz

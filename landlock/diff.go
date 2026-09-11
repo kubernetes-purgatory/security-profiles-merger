@@ -83,8 +83,8 @@ type NetRuleChange struct {
 }
 
 // Diff compares two Landlock profiles and returns a structured diff.
-// Paths are normalized (via filepath.Clean) and duplicates are removed before
-// comparing, so "/var/log/../data" and "/var/data" are treated as identical.
+// Paths are cleaned and duplicates are removed before comparing, so
+// "/var/log/../data" and "/var/data" are treated as identical.
 // Unlike Intersect and Union, Diff does not validate profiles before comparing.
 // Returns ErrNilProfile if either profile is nil.
 func Diff(left, right *Profile) (*ProfileDiff, error) {

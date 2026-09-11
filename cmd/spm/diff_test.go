@@ -333,11 +333,12 @@ func TestDiffOutputFlagBadPath(t *testing.T) {
 		fileA, fileA,
 	}, nil)
 
-	if code != 1 {
-		t.Fatalf("exit code = %d, want 1", code)
+	// Exit code 1 is reserved for "profiles differ".
+	if code != exitUsage {
+		t.Fatalf("exit code = %d, want %d", code, exitUsage)
 	}
 
-	if !strings.Contains(stderr, "creating output file") {
+	if !strings.Contains(stderr, "writing output file") {
 		t.Errorf("stderr = %q, missing output file error", stderr)
 	}
 }
@@ -377,5 +378,30 @@ func TestDiffStdinArrayWithFileRequiresTwoProfiles(t *testing.T) {
 
 	if !strings.Contains(stderr, "got 3 profiles") {
 		t.Errorf("expected profile count error, got: %s", stderr)
+	}
+}
+
+func TestDiffOutputFileWrittenWhenDifferent(t *testing.T) {
+	t.Parallel()
+
+	outFile := filepath.Join(t.TempDir(), "diff.json")
+	left := writeTemp(t, seccompJSON(t, testSyscallRead))
+	right := writeTemp(t, seccompJSON(t, "write"))
+
+	code, _, stderr := runCapture(t, []string{
+		cmdDiff, flagType, typeSeccomp, "--output", outFile, left, right,
+	}, nil)
+
+	if code != exitDiff {
+		t.Fatalf("exit code = %d, want %d: %s", code, exitDiff, stderr)
+	}
+
+	data, err := os.ReadFile(outFile)
+	if err != nil {
+		t.Fatalf("reading output file: %v", err)
+	}
+
+	if !strings.Contains(string(data), `"equal": false`) {
+		t.Errorf("output file = %q, want the diff", data)
 	}
 }

@@ -23,12 +23,13 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"path/filepath"
-
-	"sigs.k8s.io/security-profiles-merger/apparmor"
-	"sigs.k8s.io/security-profiles-merger/landlock"
-	"sigs.k8s.io/security-profiles-merger/seccomp"
+	"reflect"
+	"slices"
+	"strconv"
+	"strings"
 )
 
 const mergeUsage = `Usage: spm merge [options] [files...]
@@ -78,18 +79,19 @@ func runMerge(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return 1
 	}
 
-	if code := resolveProfileType(profileType, data, stderr); code != 0 {
-		return code
-	}
-
-	outWriter, cleanup, code := openOutput(*output, stdout, stderr)
+	kind, code := resolveKind(*profileType, data, stderr)
 	if code != 0 {
 		return code
 	}
 
-	defer cleanup()
+	var out bytes.Buffer
 
-	return dispatchMerge(data, *profileType, *strategy, *format, outWriter, stderr)
+	code = kind.merge(data, *strategy, *format, &out, stderr)
+	if code != 0 {
+		return code
+	}
+
+	return flushOutput(*output, out.Bytes(), stdout, stderr)
 }
 
 func validateMergeFlags(
@@ -121,37 +123,6 @@ func validateMergeFlags(
 	return validateProfileType(profileType, stderr)
 }
 
-func dispatchMerge(
-	data [][]byte, profileType, strategy, format string, stdout, stderr io.Writer,
-) int {
-	switch profileType {
-	case typeSeccomp:
-		return mergeProfiles(
-			data, strategy, format,
-			seccomp.Intersect, seccomp.Union, seccomp.FormatProfile,
-			stdout, stderr,
-		)
-	case typeAppArmor:
-		return mergeProfiles(
-			data, strategy, format,
-			apparmor.Intersect, apparmor.Union, apparmor.FormatProfile,
-			stdout, stderr,
-		)
-	case typeLandlock:
-		return mergeProfiles(
-			data, strategy, format,
-			landlock.Intersect, landlock.Union, landlock.FormatProfile,
-			stdout, stderr,
-		)
-	default:
-		_, _ = fmt.Fprintf(
-			stderr, "error: unknown type %q (use seccomp, apparmor, or landlock)\n", profileType,
-		)
-
-		return exitUsage
-	}
-}
-
 func mergeProfiles[T any](
 	data [][]byte,
 	strategy, format string,
@@ -159,7 +130,7 @@ func mergeProfiles[T any](
 	formatFn func(*T) string,
 	stdout, stderr io.Writer,
 ) int {
-	profiles, err := unmarshalAll[T](data)
+	profiles, err := unmarshalAll[T](data, false, stderr)
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "error: %v\n", err)
 
@@ -200,6 +171,7 @@ var (
 	errEmptyInput     = errors.New("no input provided")
 	errStdinTooLarge  = fmt.Errorf("stdin input exceeds %d bytes", maxInputSize)
 	errFileTooLarge   = fmt.Errorf("file exceeds %d byte limit", maxInputSize)
+	errUnknownField   = errors.New("unknown field")
 )
 
 func readInputs(paths []string, stdin io.Reader) ([][]byte, error) {
@@ -301,21 +273,212 @@ func readFromStdin(reader io.Reader) ([][]byte, error) {
 	return [][]byte{data}, nil
 }
 
-func unmarshalAll[T any](data [][]byte) ([]*T, error) {
+// unmarshalAll decodes every raw profile. A member the profile type has no
+// field for, such as a misspelled key, silently drops the rule it was meant
+// to carry: every such member is an error when rejectUnknown is set and a
+// warning on stderr otherwise.
+func unmarshalAll[T any](data [][]byte, rejectUnknown bool, stderr io.Writer) ([]*T, error) {
 	profiles := make([]*T, len(data))
 
 	for idx, raw := range data {
-		var profile T
+		profile := new(T)
 
-		err := json.Unmarshal(raw, &profile)
+		err := json.Unmarshal(raw, profile)
 		if err != nil {
 			return nil, fmt.Errorf("parsing profile %d: %w", idx, err)
 		}
 
-		profiles[idx] = &profile
+		if unknown := unknownFields(raw, reflect.TypeFor[T]()); len(unknown) > 0 {
+			err := unknownFieldError(unknown)
+			if rejectUnknown {
+				return nil, fmt.Errorf("parsing profile %d: %w", idx, err)
+			}
+
+			_, _ = fmt.Fprintf(stderr, "warning: profile %d: %v\n", idx, err)
+		}
+
+		profiles[idx] = profile
 	}
 
 	return profiles, nil
+}
+
+func unknownFieldError(paths []string) error {
+	quoted := make([]string, len(paths))
+	for idx, field := range paths {
+		quoted[idx] = strconv.Quote(field)
+	}
+
+	if len(paths) == 1 {
+		return fmt.Errorf("%w %s", errUnknownField, quoted[0])
+	}
+
+	return fmt.Errorf("%ws %s", errUnknownField, strings.Join(quoted, ", "))
+}
+
+// unknownFields returns the members of a JSON document that the target type
+// has no field for, as paths such as "syscalls[0].arg", in document order
+// with object keys sorted. encoding/json stops at the first unknown member
+// when asked to reject them, so the document is walked here instead to
+// report every one. Members are matched to fields the way encoding/json
+// does: by the exact JSON name first, case-insensitively otherwise.
+func unknownFields(raw []byte, target reflect.Type) []string {
+	var document any
+
+	err := json.Unmarshal(raw, &document)
+	if err != nil {
+		return nil
+	}
+
+	var found []string
+
+	walkUnknownFields(document, target, "", &found)
+
+	return found
+}
+
+func walkUnknownFields(value any, typ reflect.Type, prefix string, found *[]string) {
+	for typ.Kind() == reflect.Pointer {
+		typ = typ.Elem()
+	}
+
+	kind := typ.Kind()
+
+	if kind == reflect.Struct {
+		walkStructFields(value, typ, prefix, found)
+	}
+
+	if kind == reflect.Slice || kind == reflect.Array {
+		walkSliceItems(value, typ, prefix, found)
+	}
+
+	if kind == reflect.Map {
+		walkMapValues(value, typ, prefix, found)
+	}
+}
+
+func walkSliceItems(value any, typ reflect.Type, prefix string, found *[]string) {
+	// []byte and json.RawMessage take any JSON value.
+	if typ.Elem().Kind() == reflect.Uint8 {
+		return
+	}
+
+	items, ok := value.([]any)
+	if !ok {
+		return
+	}
+
+	for idx, item := range items {
+		walkUnknownFields(item, typ.Elem(), prefix+"["+strconv.Itoa(idx)+"]", found)
+	}
+}
+
+func walkMapValues(value any, typ reflect.Type, prefix string, found *[]string) {
+	object, ok := value.(map[string]any)
+	if !ok {
+		return
+	}
+
+	for _, key := range slices.Sorted(maps.Keys(object)) {
+		walkUnknownFields(object[key], typ.Elem(), joinFieldPath(prefix, key), found)
+	}
+}
+
+func walkStructFields(value any, typ reflect.Type, prefix string, found *[]string) {
+	object, ok := value.(map[string]any)
+	if !ok {
+		return
+	}
+
+	fields := jsonFields(typ)
+
+	for _, key := range slices.Sorted(maps.Keys(object)) {
+		fieldType, known := fields.lookup(key)
+		if !known {
+			*found = append(*found, joinFieldPath(prefix, key))
+
+			continue
+		}
+
+		walkUnknownFields(object[key], fieldType, joinFieldPath(prefix, key), found)
+	}
+}
+
+func joinFieldPath(prefix, key string) string {
+	if prefix == "" {
+		return key
+	}
+
+	return prefix + "." + key
+}
+
+// fieldSet maps the JSON names of a struct's fields to their types, once by
+// exact name and once case-folded for the fallback match.
+type fieldSet struct {
+	exact  map[string]reflect.Type
+	folded map[string]reflect.Type
+}
+
+func (set fieldSet) lookup(key string) (reflect.Type, bool) {
+	if fieldType, ok := set.exact[key]; ok {
+		return fieldType, true
+	}
+
+	fieldType, ok := set.folded[strings.ToLower(key)]
+
+	return fieldType, ok
+}
+
+// jsonFields collects the JSON-visible fields of a struct type, including
+// those promoted from embedded structs.
+func jsonFields(typ reflect.Type) fieldSet {
+	set := fieldSet{exact: map[string]reflect.Type{}, folded: map[string]reflect.Type{}}
+
+	for idx := range typ.NumField() {
+		field := typ.Field(idx)
+		name, _, _ := strings.Cut(field.Tag.Get("json"), ",")
+
+		if name == "-" || !field.IsExported() && !field.Anonymous {
+			continue
+		}
+
+		if field.Anonymous && name == "" {
+			set.addPromoted(field.Type)
+
+			continue
+		}
+
+		if name == "" {
+			name = field.Name
+		}
+
+		set.add(name, field.Type)
+	}
+
+	return set
+}
+
+func (set fieldSet) add(name string, fieldType reflect.Type) {
+	if _, exists := set.exact[name]; exists {
+		return
+	}
+
+	set.exact[name] = fieldType
+	set.folded[strings.ToLower(name)] = fieldType
+}
+
+func (set fieldSet) addPromoted(embedded reflect.Type) {
+	for embedded.Kind() == reflect.Pointer {
+		embedded = embedded.Elem()
+	}
+
+	if embedded.Kind() != reflect.Struct {
+		return
+	}
+
+	for name, fieldType := range jsonFields(embedded).exact {
+		set.add(name, fieldType)
+	}
 }
 
 func writeOutput(

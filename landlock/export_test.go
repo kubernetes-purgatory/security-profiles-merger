@@ -16,6 +16,20 @@ limitations under the License.
 
 package landlock
 
+import (
+	"maps"
+	"slices"
+)
+
 // IsAncestorOrSelf exposes isAncestorOrSelf to external tests so the fuzz
 // oracle evaluates path hierarchy exactly like the merge does.
 var IsAncestorOrSelf = isAncestorOrSelf
+
+// KnownFSRights, KnownNetRights, and KnownScopeRights expose the rights
+// Validate accepts, in a stable order, so tests and fuzzers enumerate the
+// same set the package does.
+func KnownFSRights() []FSAccessRight { return slices.Sorted(maps.Keys(fsAccessABI)) }
+
+func KnownNetRights() []NetAccessRight { return slices.Sorted(maps.Keys(netAccessABI)) }
+
+func KnownScopeRights() []ScopeRight { return slices.Sorted(maps.Keys(scopeABI)) }

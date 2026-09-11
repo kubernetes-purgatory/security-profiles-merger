@@ -18,53 +18,24 @@ package landlock_test
 
 import (
 	"cmp"
-	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
 
+	"sigs.k8s.io/security-profiles-merger/internal/merge"
 	"sigs.k8s.io/security-profiles-merger/landlock"
 )
 
 func allFSRightsForFuzz() []landlock.FSAccessRight {
-	return []landlock.FSAccessRight{
-		landlock.FSAccessExecute,
-		landlock.FSAccessWriteFile,
-		landlock.FSAccessReadFile,
-		landlock.FSAccessReadDir,
-		landlock.FSAccessRemoveDir,
-		landlock.FSAccessRemoveFile,
-		landlock.FSAccessMakeChar,
-		landlock.FSAccessMakeDir,
-		landlock.FSAccessMakeReg,
-		landlock.FSAccessMakeSock,
-		landlock.FSAccessMakeFIFO,
-		landlock.FSAccessMakeSym,
-		landlock.FSAccessMakeBlock,
-		landlock.FSAccessRefer,
-		landlock.FSAccessTruncate,
-		landlock.FSAccessIOCTLDev,
-		landlock.FSAccessResolveUnix,
-		landlock.FSAccessCreateTmp,
-	}
+	return landlock.KnownFSRights()
 }
 
 func allNetRightsForFuzz() []landlock.NetAccessRight {
-	return []landlock.NetAccessRight{
-		landlock.NetAccessBindTCP,
-		landlock.NetAccessConnectTCP,
-		landlock.NetAccessBindUDP,
-		landlock.NetAccessConnectSendUDP,
-		landlock.NetAccessListenTCP,
-		landlock.NetAccessAcceptTCP,
-	}
+	return landlock.KnownNetRights()
 }
 
 func allScopeRightsForFuzz() []landlock.ScopeRight {
-	return []landlock.ScopeRight{
-		landlock.ScopeAbstractUnixSocket,
-		landlock.ScopeSignal,
-	}
+	return landlock.KnownScopeRights()
 }
 
 func fuzzLandlockProfile(
@@ -102,7 +73,7 @@ func fuzzLandlockProfile(
 // inputs Validate rejects: empty paths, paths that clean to ".", and paths
 // with NUL bytes.
 func fuzzPath(path, fallback string) string {
-	path = filepath.Clean(strings.ReplaceAll(path, "\x00", ""))
+	path = merge.CleanPath(strings.ReplaceAll(path, "\x00", ""))
 	if path == "." {
 		return fallback
 	}
@@ -773,22 +744,11 @@ func normalized(t *testing.T, profile *landlock.Profile) *landlock.Profile {
 }
 
 func allFSRights() []landlock.FSAccessRight {
-	return []landlock.FSAccessRight{
-		landlock.FSAccessExecute, landlock.FSAccessWriteFile, landlock.FSAccessReadFile,
-		landlock.FSAccessReadDir, landlock.FSAccessRemoveDir, landlock.FSAccessRemoveFile,
-		landlock.FSAccessMakeChar, landlock.FSAccessMakeDir, landlock.FSAccessMakeReg,
-		landlock.FSAccessMakeSock, landlock.FSAccessMakeFIFO, landlock.FSAccessMakeSym,
-		landlock.FSAccessMakeBlock, landlock.FSAccessRefer, landlock.FSAccessTruncate,
-		landlock.FSAccessIOCTLDev, landlock.FSAccessResolveUnix, landlock.FSAccessCreateTmp,
-	}
+	return landlock.KnownFSRights()
 }
 
 func allNetRights() []landlock.NetAccessRight {
-	return []landlock.NetAccessRight{
-		landlock.NetAccessBindTCP, landlock.NetAccessConnectTCP,
-		landlock.NetAccessBindUDP, landlock.NetAccessConnectSendUDP,
-		landlock.NetAccessListenTCP, landlock.NetAccessAcceptTCP,
-	}
+	return landlock.KnownNetRights()
 }
 
 func assertUnionInvariants(

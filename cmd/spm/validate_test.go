@@ -534,7 +534,67 @@ func TestValidateArtifactRequiresSeccomp(t *testing.T) {
 		t.Fatalf("exit code = %d, want %d", code, exitUsage)
 	}
 
-	if !strings.Contains(stderr, "seccomp profiles only") {
-		t.Errorf("stderr = %q, want the seccomp-only message", stderr)
+	if !strings.Contains(stderr, "--artifact is not supported for apparmor profiles") {
+		t.Errorf("stderr = %q, want the unsupported-type message", stderr)
+	}
+}
+
+func TestValidateStrictRejectsUnknownFields(t *testing.T) {
+	t.Parallel()
+
+	// "arg" instead of "args" would silently drop the filter.
+	file := writeTemp(t, `{"defaultAction":"SCMP_ACT_ERRNO","syscalls":[`+
+		`{"names":["read"],"action":"SCMP_ACT_ALLOW","arg":[{"index":0,"value":1,"op":"SCMP_CMP_EQ"}]}]}`)
+
+	code, _, stderr := runCapture(t, []string{
+		cmdValidate, flagType, typeSeccomp, "--strict", file,
+	}, nil)
+
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1: %s", code, stderr)
+	}
+
+	if !strings.Contains(stderr, `error: parsing profile 0: unknown field "syscalls[0].arg"`) {
+		t.Errorf("stderr = %q, want the unknown field named", stderr)
+	}
+}
+
+func TestValidateWarnsAboutUnknownFields(t *testing.T) {
+	t.Parallel()
+
+	file := writeTemp(t, `{"defaultAction":"SCMP_ACT_ERRNO","defaultErrnoRett":1}`)
+
+	code, stdout, stderr := runCapture(t, []string{
+		cmdValidate, flagType, typeSeccomp, file,
+	}, nil)
+
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0: %s", code, stderr)
+	}
+
+	if !strings.Contains(stderr, `warning: profile 0: unknown field "defaultErrnoRett"`) {
+		t.Errorf("stderr = %q, want a warning about the unknown field", stderr)
+	}
+
+	if !strings.Contains(stdout, "SCMP_ACT_ERRNO") {
+		t.Errorf("stdout = %q, want the validated profile", stdout)
+	}
+}
+
+func TestValidateStrictWithArtifactRejected(t *testing.T) {
+	t.Parallel()
+
+	file := writeTemp(t, seccompJSON(t, testSyscallRead))
+
+	code, _, stderr := runCapture(t, []string{
+		cmdValidate, flagType, typeSeccomp, "--strict", "--artifact", file,
+	}, nil)
+
+	if code != exitUsage {
+		t.Fatalf("exit code = %d, want %d: %s", code, exitUsage, stderr)
+	}
+
+	if !strings.Contains(stderr, "--strict cannot be combined with --artifact") {
+		t.Errorf("stderr = %q, want the flag conflict reported", stderr)
 	}
 }

@@ -19,6 +19,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -731,7 +732,7 @@ func TestMergeOutputFlagBadPath(t *testing.T) {
 		t.Fatalf("exit code = %d, want 1", code)
 	}
 
-	if !strings.Contains(stderr, "creating output file") {
+	if !strings.Contains(stderr, "writing output file") {
 		t.Errorf("stderr = %q, missing output file error", stderr)
 	}
 }
@@ -854,4 +855,106 @@ func syscallNames(syscalls []specs.LinuxSyscall) []string {
 	}
 
 	return names
+}
+
+func TestMergeWarnsAboutUnknownFields(t *testing.T) {
+	t.Parallel()
+
+	file := writeTemp(t, `{"defaultAction":"SCMP_ACT_ERRNO","syscalls":[`+
+		`{"names":["read"],"action":"SCMP_ACT_ALLOW","comment":"needed"}]}`)
+
+	code, stdout, stderr := runCapture(t, []string{
+		cmdMerge, flagType, typeSeccomp, flagStrategy, strategyIntersect, file,
+	}, nil)
+
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0: %s", code, stderr)
+	}
+
+	if !strings.Contains(stderr, `warning: profile 0: unknown field "syscalls[0].comment"`) {
+		t.Errorf("stderr = %q, want a warning about the unknown field", stderr)
+	}
+
+	if !strings.Contains(stdout, `"read"`) {
+		t.Errorf("stdout = %q, want the merged profile", stdout)
+	}
+}
+
+func TestMergeOutputFileUntouchedOnFailure(t *testing.T) {
+	t.Parallel()
+
+	const (
+		keep     = "keep me"
+		wantPerm = os.FileMode(0o600)
+	)
+
+	outFile := filepath.Join(t.TempDir(), "output.json")
+
+	err := os.WriteFile(outFile, []byte(keep), wantPerm)
+	if err != nil {
+		t.Fatalf("writing output file: %v", err)
+	}
+
+	bad := writeTemp(t, "not json")
+
+	code, _, _ := runCapture(t, []string{
+		cmdMerge, flagType, typeSeccomp, flagStrategy, strategyIntersect,
+		"--output", outFile, bad,
+	}, nil)
+
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+
+	data, err := os.ReadFile(outFile)
+	if err != nil {
+		t.Fatalf("reading output file: %v", err)
+	}
+
+	if string(data) != keep {
+		t.Errorf("output file = %q, want %q (untouched on failure)", data, keep)
+	}
+}
+
+func TestUnmarshalAllReportsEveryUnknownField(t *testing.T) {
+	t.Parallel()
+
+	// A harmless unknown key must not hide a misspelled one further down.
+	raw := `{"defaultAction":"SCMP_ACT_ERRNO","comment":"x","syscalls":[` +
+		`{"names":["read"],"action":"SCMP_ACT_ALLOW","Args":[],"arg":[{"index":0}]}]}`
+
+	var stderr bytes.Buffer
+
+	profiles, err := unmarshalAll[specs.LinuxSeccomp]([][]byte{[]byte(raw)}, false, &stderr)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(profiles) != 1 || profiles[0].DefaultAction != specs.ActErrno {
+		t.Fatalf("profiles = %+v, want the decoded profile", profiles)
+	}
+
+	// "Args" matches the "args" field case-insensitively, as encoding/json
+	// decodes it, so only the two real strangers are reported.
+	want := `warning: profile 0: unknown fields "comment", "syscalls[0].arg"`
+	if !strings.Contains(stderr.String(), want) {
+		t.Errorf("stderr = %q, want %q", stderr.String(), want)
+	}
+
+	_, err = unmarshalAll[specs.LinuxSeccomp]([][]byte{[]byte(raw)}, true, &bytes.Buffer{})
+	if !errors.Is(err, errUnknownField) {
+		t.Errorf("expected errUnknownField when rejecting, got: %v", err)
+	}
+}
+
+func TestUnmarshalAllRejectsTrailingData(t *testing.T) {
+	t.Parallel()
+
+	_, err := unmarshalAll[specs.LinuxSeccomp](
+		[][]byte{[]byte(`{"defaultAction":"SCMP_ACT_ERRNO"} trailing`)},
+		false, &bytes.Buffer{},
+	)
+	if err == nil || !strings.Contains(err.Error(), "after top-level value") {
+		t.Errorf("expected a trailing data error, got: %v", err)
+	}
 }

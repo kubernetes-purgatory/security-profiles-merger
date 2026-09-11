@@ -17,13 +17,13 @@ limitations under the License.
 package apparmor_test
 
 import (
-	"path/filepath"
 	"reflect"
 	"slices"
 	"strings"
 	"testing"
 
 	"sigs.k8s.io/security-profiles-merger/apparmor"
+	"sigs.k8s.io/security-profiles-merger/internal/merge"
 )
 
 func capsFromMask(mask uint64) []string {
@@ -92,7 +92,7 @@ func sanitizeFuzzPath(fuzzPath, fallback string) string {
 		return fallback
 	}
 
-	return filepath.Clean(fuzzPath)
+	return merge.CleanPath(fuzzPath)
 }
 
 func addAppArmorFuzzSeeds(f *testing.F) {
