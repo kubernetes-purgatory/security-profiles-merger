@@ -676,7 +676,7 @@ func TestIntersectFlags(t *testing.T) {
 	}
 }
 
-func TestIntersectFlagsOneEmpty(t *testing.T) {
+func TestIntersectFlagsHardeningSurvivesEmpty(t *testing.T) {
 	t.Parallel()
 
 	left := &specs.LinuxSeccomp{
@@ -691,8 +691,10 @@ func TestIntersectFlagsOneEmpty(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	if len(result.Flags) != 0 {
-		t.Errorf("flags = %v, want none (empty means no flags)", result.Flags)
+	// A profile without flags must not drop the baseline's audit logging.
+	want := []specs.LinuxSeccompFlag{specs.LinuxSeccompFlagLog}
+	if !slices.Equal(result.Flags, want) {
+		t.Errorf("flags = %v, want %v", result.Flags, want)
 	}
 }
 
@@ -751,12 +753,18 @@ func TestUnionFlagsSorted(t *testing.T) {
 
 	left := &specs.LinuxSeccomp{
 		DefaultAction: specs.ActErrno,
-		Flags:         []specs.LinuxSeccompFlag{specs.LinuxSeccompFlagSpecAllow},
+		Flags: []specs.LinuxSeccompFlag{
+			specs.LinuxSeccompFlagSpecAllow,
+			specs.LinuxSeccompFlagLog,
+		},
 	}
 
 	right := &specs.LinuxSeccomp{
 		DefaultAction: specs.ActErrno,
-		Flags:         []specs.LinuxSeccompFlag{specs.LinuxSeccompFlagLog},
+		Flags: []specs.LinuxSeccompFlag{
+			specs.LinuxSeccompFlagLog,
+			specs.LinuxSeccompFlagSpecAllow,
+		},
 	}
 
 	result, err := seccomp.Union(left, right)
@@ -2696,5 +2704,125 @@ func TestIntersectFlagsRequireBothSides(t *testing.T) {
 
 	if len(result.Flags) != 0 {
 		t.Errorf("flags = %v, want none", result.Flags)
+	}
+}
+
+func TestIntersectValueTwoIgnoredOnNonMaskedOperator(t *testing.T) {
+	t.Parallel()
+
+	// libseccomp reads valueTwo only for SCMP_CMP_MASKED_EQ, so these two
+	// conditions are the same filter and the syscall must stay permitted.
+	left := &specs.LinuxSeccomp{
+		DefaultAction: specs.ActErrno,
+		Syscalls: []specs.LinuxSyscall{{
+			Names:  []string{syscallWrite},
+			Action: specs.ActAllow,
+			Args:   []specs.LinuxSeccompArg{{Index: 0, Value: 1, ValueTwo: 0, Op: specs.OpEqualTo}},
+		}},
+	}
+
+	right := &specs.LinuxSeccomp{
+		DefaultAction: specs.ActErrno,
+		Syscalls: []specs.LinuxSyscall{{
+			Names:  []string{syscallWrite},
+			Action: specs.ActAllow,
+			Args:   []specs.LinuxSeccompArg{{Index: 0, Value: 1, ValueTwo: 7, Op: specs.OpEqualTo}},
+		}},
+	}
+
+	result, err := seccomp.Intersect(left, right)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	want := []specs.LinuxSyscall{{
+		Names:  []string{syscallWrite},
+		Action: specs.ActAllow,
+		Args:   []specs.LinuxSeccompArg{{Index: 0, Value: 1, ValueTwo: 0, Op: specs.OpEqualTo}},
+	}}
+
+	if !slices.EqualFunc(result.Syscalls, want, syscallsEqual) {
+		t.Errorf("syscalls = %s, want a single unconditional allow for %s",
+			seccomp.FormatProfile(result), syscallWrite)
+	}
+}
+
+func syscallsEqual(a, b specs.LinuxSyscall) bool {
+	return slices.Equal(a.Names, b.Names) && a.Action == b.Action &&
+		slices.Equal(a.Args, b.Args)
+}
+
+func TestSingleProfileIsNormalized(t *testing.T) {
+	t.Parallel()
+
+	profile := &specs.LinuxSeccomp{
+		DefaultAction: specs.ActErrno,
+		Syscalls: []specs.LinuxSyscall{
+			{Names: []string{syscallWrite}, Action: specs.ActAllow},
+			{Names: []string{syscallWrite}, Action: specs.ActErrno},
+			{
+				Names:  []string{syscallWrite},
+				Action: specs.ActAllow,
+				Args:   []specs.LinuxSeccompArg{{Index: 0, Value: 1, Op: specs.OpEqualTo}},
+			},
+		},
+	}
+
+	for name, mergeFn := range map[string]func(...*specs.LinuxSeccomp) (*specs.LinuxSeccomp, error){
+		"Intersect": seccomp.Intersect,
+		"Union":     seccomp.Union,
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			single, err := mergeFn(profile)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			pair, err := mergeFn(profile, profile)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			if seccomp.FormatProfile(single) != seccomp.FormatProfile(pair) {
+				t.Errorf("single profile result %s differs from self-merge %s",
+					seccomp.FormatProfile(single), seccomp.FormatProfile(pair))
+			}
+
+			// The first unconditional entry wins and drops the conditional
+			// one, so exactly one unconditional allow entry remains.
+			if len(single.Syscalls) != 1 || len(single.Syscalls[0].Args) != 0 ||
+				single.Syscalls[0].Action != specs.ActAllow {
+				t.Errorf(
+					"syscalls = %s, want a single unconditional allow",
+					seccomp.FormatProfile(single),
+				)
+			}
+
+			assertDeterministic(t, mergeFn, profile, seccomp.FormatProfile(single))
+		})
+	}
+}
+
+// assertDeterministic merges the profile repeatedly and fails on the first
+// result that differs from want.
+func assertDeterministic(
+	t *testing.T,
+	mergeFn func(...*specs.LinuxSeccomp) (*specs.LinuxSeccomp, error),
+	profile *specs.LinuxSeccomp,
+	want string,
+) {
+	t.Helper()
+
+	for range 50 {
+		again, err := mergeFn(profile)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		if got := seccomp.FormatProfile(again); got != want {
+			t.Fatalf("output not deterministic: %s vs %s", got, want)
+		}
 	}
 }

@@ -21,11 +21,19 @@ import (
 	"fmt"
 	"maps"
 	"slices"
+	"strconv"
+	"strings"
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 )
 
-const maxSyscallArgIndex = 5
+const (
+	maxSyscallArgIndex = 5
+	// maxErrno is the largest errno the kernel can return (MAX_ERRNO). runc
+	// narrows errnoRet to int16, so larger values wrap into a different
+	// errno than the profile author wrote.
+	maxErrno = 4095
+)
 
 var (
 	// ErrUnknownAction is returned when a profile contains an unrecognized
@@ -68,6 +76,13 @@ var (
 	// ErrTooManyEntries is returned by ValidateArtifact when one syscall
 	// name appears in more than MaxArtifactEntriesPerSyscall entries.
 	ErrTooManyEntries = errors.New("too many entries for syscall")
+	// ErrErrnoOutOfRange is returned when errnoRet or defaultErrnoRet
+	// exceeds the largest errno the kernel can return.
+	ErrErrnoOutOfRange = errors.New("errno out of range")
+	// ErrUnusedValueTwo is returned by ValidateStrict when an argument
+	// condition sets valueTwo with an operator other than
+	// SCMP_CMP_MASKED_EQ, the only one that reads it.
+	ErrUnusedValueTwo = errors.New("valueTwo is only used by SCMP_CMP_MASKED_EQ")
 )
 
 // MaxArtifactEntriesPerSyscall bounds how many entries may name the same
@@ -123,27 +138,31 @@ func Validate(profile *specs.LinuxSeccomp) error {
 
 // ValidateStrict performs all checks from Validate and additionally detects
 // duplicate syscall names across entries, unknown architectures, unknown
-// flags, unknown arg operators, and out-of-range arg indices. The OCI
-// runtime-spec allows the same syscall to appear in multiple entries (for
-// example with different argument filters), so the merge path uses Validate
-// which permits this. ValidateStrict is intended for user-authored profiles
-// where duplicates are likely mistakes.
+// flags, unknown arg operators, out-of-range arg indices and errno values,
+// and valueTwo set on an operator that ignores it. The OCI runtime-spec
+// allows the same syscall to appear in multiple entries (for example with
+// different argument filters), so the merge path uses Validate which permits
+// this. ValidateStrict is intended for user-authored profiles where
+// duplicates are likely mistakes.
 func ValidateStrict(profile *specs.LinuxSeccomp) error {
-	return validateWith(profile, validateDuplicateNames, validateShape)
+	return validateWith(profile, validateDuplicateNames, validateShape, validateUnusedValueTwo)
 }
 
 // ValidateArtifact validates a profile received from an untrusted source,
 // such as an OCI artifact pulled by a container runtime (KEP-6061). It
 // performs all checks from Validate and the shape checks from ValidateStrict
-// (unknown or duplicate architectures and flags, unknown arg operators, and
-// out-of-range arg indices), and rejects two things a distributed profile
-// must not control: SCMP_ACT_NOTIFY, because it needs a listener that only
-// the runtime can provide, and listenerPath or listenerMetadata, because they
-// name a node-local socket. Duplicate syscall names are allowed, as the OCI
-// runtime-spec permits them and Intersect handles them, but no syscall may
-// appear in more than MaxArtifactEntriesPerSyscall entries, which bounds the
-// merge cost. ValidateArtifact does not compare the profile against a
-// baseline; callers intersect the result with their baseline afterwards.
+// (unknown or duplicate architectures and flags, unknown arg operators,
+// out-of-range arg indices and errno values), and rejects what a distributed
+// profile must not control: SCMP_ACT_NOTIFY, because it needs a listener
+// that only the runtime can provide, and the listener settings listenerPath,
+// listenerMetadata and SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV, because they
+// belong to the node-local listener. Duplicate syscall names are allowed, as
+// the OCI runtime-spec permits them and Intersect handles them, but no
+// syscall may appear in more than MaxArtifactEntriesPerSyscall entries,
+// which bounds the merge cost. valueTwo on an operator other than
+// SCMP_CMP_MASKED_EQ is accepted and ignored, as runtimes ignore it.
+// ValidateArtifact does not compare the profile against a baseline; callers
+// intersect the result with their baseline afterwards.
 func ValidateArtifact(profile *specs.LinuxSeccomp) error {
 	return validateWith(
 		profile,
@@ -183,7 +202,48 @@ func validateShape(profile *specs.LinuxSeccomp) error {
 		validateFlags(profile.Flags),
 		validateDuplicateFlags(profile.Flags),
 		validateSyscallArgs(profile.Syscalls),
+		validateErrnoRange(profile),
 	)
+}
+
+func validateErrnoRange(profile *specs.LinuxSeccomp) error {
+	var errs []error
+
+	if profile.DefaultErrnoRet != nil && *profile.DefaultErrnoRet > maxErrno {
+		errs = append(errs, fmt.Errorf(
+			"defaultErrnoRet: %w (%d, max %d)",
+			ErrErrnoOutOfRange, *profile.DefaultErrnoRet, maxErrno,
+		))
+	}
+
+	for idx := range profile.Syscalls {
+		ret := profile.Syscalls[idx].ErrnoRet
+		if ret != nil && *ret > maxErrno {
+			errs = append(errs, fmt.Errorf(
+				"syscall entry %d errnoRet: %w (%d, max %d)",
+				idx, ErrErrnoOutOfRange, *ret, maxErrno,
+			))
+		}
+	}
+
+	return errors.Join(errs...)
+}
+
+func validateUnusedValueTwo(profile *specs.LinuxSeccomp) error {
+	var errs []error
+
+	for idx := range profile.Syscalls {
+		for argIdx, arg := range profile.Syscalls[idx].Args {
+			if arg.ValueTwo != 0 && arg.Op != specs.OpMaskedEqual {
+				errs = append(errs, fmt.Errorf(
+					"syscall entry %d arg %d: %w (%s)",
+					idx, argIdx, ErrUnusedValueTwo, arg.Op,
+				))
+			}
+		}
+	}
+
+	return errors.Join(errs...)
 }
 
 func validateDuplicateNames(profile *specs.LinuxSeccomp) error {
@@ -249,28 +309,83 @@ func validateNoListener(profile *specs.LinuxSeccomp) error {
 		))
 	}
 
+	if slices.Contains(profile.Flags, specs.LinuxSeccompFlagWaitKillableRecv) {
+		errs = append(errs, fmt.Errorf(
+			"flag %s: %w", specs.LinuxSeccompFlagWaitKillableRecv, ErrListenerNotAllowed,
+		))
+	}
+
 	return errors.Join(errs...)
 }
 
+// validateDuplicateSyscallNames reports each duplicated syscall name once,
+// listing every entry that names it, and separately when a name repeats
+// within a single entry.
 func validateDuplicateSyscallNames(syscalls []specs.LinuxSyscall) error {
-	seen := make(map[string]int)
+	type occurrence struct {
+		entries    []int
+		repeatedIn []int
+	}
+
+	seen := make(map[string]*occurrence)
+
+	for idx, sc := range syscalls {
+		inEntry := make(map[string]struct{}, len(sc.Names))
+
+		for _, name := range sc.Names {
+			current, ok := seen[name]
+			if !ok {
+				current = &occurrence{entries: nil, repeatedIn: nil}
+				seen[name] = current
+			}
+
+			if _, dup := inEntry[name]; dup {
+				if !slices.Contains(current.repeatedIn, idx) {
+					current.repeatedIn = append(current.repeatedIn, idx)
+				}
+
+				continue
+			}
+
+			inEntry[name] = struct{}{}
+
+			current.entries = append(current.entries, idx)
+		}
+	}
 
 	var errs []error
 
-	for idx, sc := range syscalls {
-		for _, name := range sc.Names {
-			if prev, ok := seen[name]; ok {
-				errs = append(errs, fmt.Errorf(
-					"syscall %q in entries %d and %d: %w",
-					name, prev, idx, ErrDuplicateSyscallName,
-				))
-			} else {
-				seen[name] = idx
-			}
+	for _, name := range slices.Sorted(maps.Keys(seen)) {
+		current := seen[name]
+
+		if len(current.entries) > 1 {
+			errs = append(errs, fmt.Errorf(
+				"syscall %q in entries %s: %w",
+				name, formatEntries(current.entries), ErrDuplicateSyscallName,
+			))
+		}
+
+		for _, idx := range current.repeatedIn {
+			errs = append(errs, fmt.Errorf(
+				"syscall %q repeated within entry %d: %w",
+				name, idx, ErrDuplicateSyscallName,
+			))
 		}
 	}
 
 	return errors.Join(errs...)
+}
+
+// formatEntries renders entry indices as "0 and 1" or "0, 1 and 2".
+func formatEntries(entries []int) string {
+	parts := make([]string, len(entries))
+	for idx, entry := range entries {
+		parts[idx] = strconv.Itoa(entry)
+	}
+
+	last := len(parts) - 1
+
+	return strings.Join(parts[:last], ", ") + " and " + parts[last]
 }
 
 func validateAction(action specs.LinuxSeccompAction, context string) error {

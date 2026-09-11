@@ -67,15 +67,31 @@ var (
 // other profile. Per the OCI runtime-spec, empty means "native architecture
 // only", but the native architecture is unknown at merge time. Callers that
 // need precise architecture intersection should populate the native
-// architecture explicitly before merging.
+// architecture explicitly before merging, for example with
+// PopulateNativeArchitecture. Two non-empty lists with no architecture in
+// common intersect to an empty list, which the runtime-spec again reads as
+// "native architecture only".
 //
-// Flags are intersected as a set: a flag survives only if every profile
-// sets it. An empty Flags list means "no flags", so intersecting with it
-// yields no flags. This keeps a profile from enabling
-// SECCOMP_FILTER_FLAG_SPEC_ALLOW over a baseline that did not.
+// Flags are merged by what they do. SECCOMP_FILTER_FLAG_SPEC_ALLOW loosens
+// confinement and survives only if every profile sets it, so a profile
+// cannot disable a mitigation the baseline keeps. SECCOMP_FILTER_FLAG_LOG
+// hardens auditing and survives if any profile sets it, so a profile cannot
+// silence the baseline's logging. SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV
+// belongs to the listener and, like ListenerPath, is taken from the first
+// profile. Unknown flags are treated like SECCOMP_FILTER_FLAG_LOG. An empty
+// Flags list means "no flags".
+//
+// Argument conditions are compared as runtimes evaluate them: valueTwo is
+// only significant for SCMP_CMP_MASKED_EQ and is cleared for every other
+// operator, so conditions that differ only there are the same filter.
+//
+// A single profile is normalized as if merged with itself, so the result is
+// deterministic and follows the same evaluation model as a merge.
 //
 // Syscall entries in the result are grouped: names sharing the same action,
-// errno, and argument filters are emitted as one entry, sorted by name.
+// errno, and argument filters are emitted as one entry, sorted by name, then
+// by argument filter, action, and errno, so equal inputs always produce the
+// same output.
 //
 // This implements the profile merging semantics defined in KEP-6061 for CRI
 // runtimes merging OCI-pulled profiles with node baselines.
@@ -98,8 +114,13 @@ func Intersect(profiles ...*specs.LinuxSeccomp) (*specs.LinuxSeccomp, error) {
 // When two profiles share the same default or syscall action, DefaultErrnoRet
 // and per-syscall ErrnoRet are taken from the earlier (leftmost) profile.
 //
-// Syscall entries in the result are grouped: names sharing the same action,
-// errno, and argument filters are emitted as one entry, sorted by name.
+// Flags mirror Intersect: SECCOMP_FILTER_FLAG_SPEC_ALLOW survives if any
+// profile sets it, SECCOMP_FILTER_FLAG_LOG only if every profile does, and
+// SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV comes from the first profile.
+// Architectures are combined.
+//
+// Argument conditions, single profiles, and output ordering are handled as
+// described for Intersect.
 //
 // This implements the merge semantics used by the Security Profiles Operator
 // for combining recorded profiles.
@@ -120,6 +141,12 @@ func foldProfiles(
 		if err != nil {
 			return nil, fmt.Errorf("validate: %w", err)
 		}
+	}
+
+	// A single profile is merged with itself so that it goes through the
+	// same evaluation model as a real merge instead of a plain clone.
+	if len(profiles) == 1 {
+		profiles = []*specs.LinuxSeccomp{profiles[0], profiles[0]}
 	}
 
 	result, err := merge.Fold(
@@ -168,14 +195,14 @@ func mergeTwo(
 		args:     nil,
 	}
 
+	merged.Flags = mergeFlags(left.Flags, right.Flags, strategy.isIntersect)
+
 	if strategy.isIntersect {
 		merged.Syscalls = intersectRules().mergeProfileSyscalls(left, right, mergedDefault)
 		merged.Architectures = intersectWithEmpty(left.Architectures, right.Architectures)
-		merged.Flags = merge.IntersectSlice(left.Flags, right.Flags)
 	} else {
 		merged.Syscalls = unionRules().mergeProfileSyscalls(left, right, mergedDefault)
 		merged.Architectures = merge.UnionSlice(left.Architectures, right.Architectures)
-		merged.Flags = merge.UnionSlice(left.Flags, right.Flags)
 	}
 
 	return merged
@@ -195,11 +222,13 @@ func intersectWithEmpty[T comparable](left, right []T) []T {
 
 // regroupSyscalls drops entries without names, merges entries sharing the
 // same action, errno, and argument filters into one multi-name entry, and
-// sorts the result by first name, then by argument filter.
+// sorts the result by first name, then by argument filter, action, and
+// errno, which is a total order over the result.
 func regroupSyscalls(syscalls []specs.LinuxSyscall) []specs.LinuxSyscall {
 	type group struct {
-		entry specs.LinuxSyscall
-		names map[string]struct{}
+		entry   specs.LinuxSyscall
+		argsKey string
+		names   map[string]struct{}
 	}
 
 	groups := make(map[string]*group)
@@ -214,14 +243,16 @@ func regroupSyscalls(syscalls []specs.LinuxSyscall) []specs.LinuxSyscall {
 
 		current, ok := groups[key]
 		if !ok {
+			args := sortedArgs(entry.Args)
 			current = &group{
 				entry: specs.LinuxSyscall{
 					Names:    nil,
 					Action:   entry.Action,
 					ErrnoRet: merge.ClonePtr(entry.ErrnoRet),
-					Args:     sortedArgs(entry.Args),
+					Args:     args,
 				},
-				names: make(map[string]struct{}),
+				argsKey: sortedArgsKey(args),
+				names:   make(map[string]struct{}),
 			}
 			groups[key] = current
 		}
@@ -231,19 +262,26 @@ func regroupSyscalls(syscalls []specs.LinuxSyscall) []specs.LinuxSyscall {
 		}
 	}
 
-	result := make([]specs.LinuxSyscall, 0, len(groups))
+	ordered := make([]*group, 0, len(groups))
 
 	for _, current := range groups {
 		current.entry.Names = slices.Sorted(maps.Keys(current.names))
-		result = append(result, current.entry)
+		ordered = append(ordered, current)
 	}
 
-	slices.SortFunc(result, func(a, b specs.LinuxSyscall) int {
+	slices.SortFunc(ordered, func(a, b *group) int {
 		return cmp.Or(
-			cmp.Compare(a.Names[0], b.Names[0]),
-			cmp.Compare(argsKey(a.Args), argsKey(b.Args)),
+			cmp.Compare(a.entry.Names[0], b.entry.Names[0]),
+			cmp.Compare(a.argsKey, b.argsKey),
+			cmp.Compare(a.entry.Action, b.entry.Action),
+			compareUintPtr(a.entry.ErrnoRet, b.entry.ErrnoRet),
 		)
 	})
+
+	result := make([]specs.LinuxSyscall, 0, len(ordered))
+	for _, current := range ordered {
+		result = append(result, current.entry)
+	}
 
 	return result
 }

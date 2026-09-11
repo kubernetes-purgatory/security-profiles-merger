@@ -72,11 +72,41 @@ full API reference (functions, errors, types, and merge semantics), see
 ### CRI runtime: merge OCI-pulled profile with node baseline (intersection)
 
 ```go
-effective, err := seccomp.Intersect(nodeBaseline, ociPulledProfile)
+// At config load: the baseline is trusted but should be well-formed.
+if err := seccomp.ValidateStrict(nodeBaseline); err != nil {
+    return err
+}
+
+// At pull time: reject what a runtime must not accept from an artifact.
+if err := seccomp.ValidateArtifact(ociPulledProfile); err != nil {
+    return err // report as a permanent rejection
+}
+
+// At apply time: an empty architecture list means "native" to the runtime
+// but "unspecified" to the merge, so populate it on every input first.
+for _, profile := range []*specs.LinuxSeccomp{nodeBaseline, podBaseProfile, ociPulledProfile} {
+    if err := seccomp.PopulateNativeArchitecture(profile); err != nil {
+        return err
+    }
+}
+
+// Inputs go from most to least trusted: the runtime baseline, the optional
+// pod-spec base profile, then the artifact. Tie-breaks such as errno values
+// favor the earlier input.
+effective, err := seccomp.Intersect(nodeBaseline, podBaseProfile, ociPulledProfile)
 if err != nil {
     return err
 }
-// effective permits only syscalls allowed by both profiles
+
+// effective permits only what every input permits. What the merge took away
+// from the artifact is visible in the diff, for logging or metrics.
+constrained, err := seccomp.Diff(ociPulledProfile, effective)
+if err != nil {
+    return err
+}
+if !constrained.Equal {
+    log.Printf("artifact constrained by baseline: %s", seccomp.FormatDiff(constrained))
+}
 ```
 
 ### Security Profiles Operator: combine recorded profiles (union)
@@ -190,7 +220,11 @@ spm merge --type seccomp --strategy intersect --format human a.json b.json
 ```sh
 spm validate --type seccomp profile.json
 spm validate --type apparmor --strict user-profile.json
+spm validate --type seccomp --artifact pulled-profile.json
 ```
+
+`--artifact` runs the checks container runtimes apply to a KEP-6061 artifact
+(seccomp only).
 
 Profiles can also be read from stdin:
 

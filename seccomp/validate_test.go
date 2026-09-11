@@ -771,3 +771,188 @@ func TestValidateArtifactEntryCount(t *testing.T) {
 		t.Fatalf("profile at the limit should validate: %v", err)
 	}
 }
+
+func TestValidateErrnoRange(t *testing.T) {
+	t.Parallel()
+
+	tooBig := uint(4096)
+	atLimit := uint(4095)
+
+	over := &specs.LinuxSeccomp{
+		DefaultAction:   specs.ActErrno,
+		DefaultErrnoRet: &tooBig,
+		Syscalls: []specs.LinuxSyscall{
+			{Names: []string{syscallWrite}, Action: specs.ActErrno, ErrnoRet: &tooBig},
+		},
+	}
+
+	for name, check := range map[string]func(*specs.LinuxSeccomp) error{
+		"ValidateStrict":   seccomp.ValidateStrict,
+		"ValidateArtifact": seccomp.ValidateArtifact,
+	} {
+		err := check(over)
+		if !errors.Is(err, seccomp.ErrErrnoOutOfRange) {
+			t.Errorf("%s: expected ErrErrnoOutOfRange, got: %v", name, err)
+		}
+
+		for _, want := range []string{"defaultErrnoRet", "syscall entry 0 errnoRet"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("%s: error should mention %s: %v", name, want, err)
+			}
+		}
+	}
+
+	err := seccomp.Validate(over)
+	if err != nil {
+		t.Errorf("Validate should not check the errno range: %v", err)
+	}
+
+	limit := &specs.LinuxSeccomp{
+		DefaultAction:   specs.ActErrno,
+		DefaultErrnoRet: &atLimit,
+		Syscalls: []specs.LinuxSyscall{
+			{Names: []string{syscallWrite}, Action: specs.ActErrno, ErrnoRet: &atLimit},
+		},
+	}
+
+	err = seccomp.ValidateArtifact(limit)
+	if err != nil {
+		t.Errorf("errno at the limit should validate: %v", err)
+	}
+}
+
+func TestValidateStrictReportsDuplicateOncePerName(t *testing.T) {
+	t.Parallel()
+
+	across := &specs.LinuxSeccomp{
+		DefaultAction: specs.ActErrno,
+		Syscalls: []specs.LinuxSyscall{
+			{Names: []string{syscallRead}, Action: specs.ActAllow},
+			{Names: []string{syscallRead}, Action: specs.ActLog},
+			{Names: []string{syscallRead}, Action: specs.ActTrace},
+		},
+	}
+
+	err := seccomp.ValidateStrict(across)
+	if !errors.Is(err, seccomp.ErrDuplicateSyscallName) {
+		t.Fatalf("expected ErrDuplicateSyscallName, got: %v", err)
+	}
+
+	if got := strings.Count(err.Error(), "duplicate syscall name"); got != 1 {
+		t.Errorf("duplicate reported %d times, want once: %v", got, err)
+	}
+
+	if !strings.Contains(err.Error(), "entries 0, 1 and 2") {
+		t.Errorf("error should list every entry: %v", err)
+	}
+
+	within := &specs.LinuxSeccomp{
+		DefaultAction: specs.ActErrno,
+		Syscalls: []specs.LinuxSyscall{
+			{Names: []string{syscallRead, syscallRead, syscallRead}, Action: specs.ActAllow},
+		},
+	}
+
+	err = seccomp.ValidateStrict(within)
+	if !errors.Is(err, seccomp.ErrDuplicateSyscallName) {
+		t.Fatalf("expected ErrDuplicateSyscallName, got: %v", err)
+	}
+
+	if got := strings.Count(err.Error(), "duplicate syscall name"); got != 1 {
+		t.Errorf("duplicate reported %d times, want once: %v", got, err)
+	}
+
+	if !strings.Contains(err.Error(), "repeated within entry 0") {
+		t.Errorf("error should point at the entry: %v", err)
+	}
+}
+
+// A name seen in an earlier entry and repeated within a later one is
+// reported against the entry that repeats it, not the first entry.
+func TestValidateStrictAttributesRepetitionToItsEntry(t *testing.T) {
+	t.Parallel()
+
+	later := &specs.LinuxSeccomp{
+		DefaultAction: specs.ActErrno,
+		Syscalls: []specs.LinuxSyscall{
+			{Names: []string{syscallRead}, Action: specs.ActAllow},
+			{Names: []string{syscallWrite}, Action: specs.ActAllow},
+			{Names: []string{syscallRead, syscallRead}, Action: specs.ActLog},
+		},
+	}
+
+	err := seccomp.ValidateStrict(later)
+	if !errors.Is(err, seccomp.ErrDuplicateSyscallName) {
+		t.Fatalf("expected ErrDuplicateSyscallName, got: %v", err)
+	}
+
+	for _, want := range []string{"entries 0 and 2", "repeated within entry 2"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error should contain %q: %v", want, err)
+		}
+	}
+
+	if strings.Contains(err.Error(), "within entry 0") {
+		t.Errorf("repetition must not be attributed to entry 0: %v", err)
+	}
+}
+
+func TestValidateStrictUnusedValueTwo(t *testing.T) {
+	t.Parallel()
+
+	unused := &specs.LinuxSeccomp{
+		DefaultAction: specs.ActErrno,
+		Syscalls: []specs.LinuxSyscall{{
+			Names:  []string{syscallWrite},
+			Action: specs.ActAllow,
+			Args:   []specs.LinuxSeccompArg{{Index: 0, Value: 1, ValueTwo: 7, Op: specs.OpEqualTo}},
+		}},
+	}
+
+	err := seccomp.ValidateStrict(unused)
+	if !errors.Is(err, seccomp.ErrUnusedValueTwo) {
+		t.Errorf("expected ErrUnusedValueTwo, got: %v", err)
+	}
+
+	err = seccomp.ValidateArtifact(unused)
+	if err != nil {
+		t.Errorf("ValidateArtifact should ignore an unused valueTwo: %v", err)
+	}
+
+	masked := &specs.LinuxSeccomp{
+		DefaultAction: specs.ActErrno,
+		Syscalls: []specs.LinuxSyscall{
+			{
+				Names:  []string{syscallWrite},
+				Action: specs.ActAllow,
+				Args: []specs.LinuxSeccompArg{
+					{Index: 0, Value: 0xf0, ValueTwo: 0x10, Op: specs.OpMaskedEqual},
+				},
+			},
+		},
+	}
+
+	err = seccomp.ValidateStrict(masked)
+	if err != nil {
+		t.Errorf("valueTwo with SCMP_CMP_MASKED_EQ should validate: %v", err)
+	}
+}
+
+func TestValidateArtifactRejectsListenerFlag(t *testing.T) {
+	t.Parallel()
+
+	profile := &specs.LinuxSeccomp{
+		DefaultAction: specs.ActErrno,
+		Flags:         []specs.LinuxSeccompFlag{specs.LinuxSeccompFlagWaitKillableRecv},
+	}
+
+	err := seccomp.ValidateArtifact(profile)
+	if !errors.Is(err, seccomp.ErrListenerNotAllowed) {
+		t.Errorf("expected ErrListenerNotAllowed, got: %v", err)
+	}
+
+	err = seccomp.ValidateStrict(profile)
+	if err != nil {
+		t.Errorf("ValidateStrict should accept the listener flag: %v", err)
+	}
+}

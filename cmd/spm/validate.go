@@ -50,6 +50,10 @@ func runValidate(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		"type", "", "profile type: seccomp, apparmor, landlock (auto-detected if omitted)",
 	)
 	strict := flags.Bool("strict", false, "use strict validation")
+	artifact := flags.Bool(
+		"artifact", false,
+		"validate as an untrusted OCI artifact the way container runtimes do (seccomp only)",
+	)
 	format := flags.String("format", formatJSON, "output format: json, human")
 	output := flags.String("output", "", "write output to file (default: stdout)")
 
@@ -88,31 +92,36 @@ func runValidate(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 
 	defer cleanup()
 
-	return dispatchValidate(data, *profileType, *strict, *format, outWriter, stderr)
+	return dispatchValidate(data, *profileType, *strict, *artifact, *format, outWriter, stderr)
 }
 
 func dispatchValidate(
-	data [][]byte, profileType string, strict bool, format string,
+	data [][]byte, profileType string, strict, artifact bool, format string,
 	stdout, stderr io.Writer,
 ) int {
+	if artifact && profileType != typeSeccomp {
+		_, _ = fmt.Fprintln(stderr, "error: --artifact applies to seccomp profiles only")
+
+		return exitUsage
+	}
+
 	switch profileType {
 	case typeSeccomp:
-		return validateProfiles(
-			data, strict, format,
-			seccomp.Validate, seccomp.ValidateStrict, seccomp.FormatProfile,
-			stdout, stderr,
-		)
+		check := pickCheck(strict, seccomp.Validate, seccomp.ValidateStrict)
+		if artifact {
+			check = seccomp.ValidateArtifact
+		}
+
+		return validateProfiles(data, check, format, seccomp.FormatProfile, stdout, stderr)
 	case typeAppArmor:
 		return validateProfiles(
-			data, strict, format,
-			apparmor.Validate, apparmor.ValidateStrict, apparmor.FormatProfile,
-			stdout, stderr,
+			data, pickCheck(strict, apparmor.Validate, apparmor.ValidateStrict),
+			format, apparmor.FormatProfile, stdout, stderr,
 		)
 	case typeLandlock:
 		return validateProfiles(
-			data, strict, format,
-			landlock.Validate, landlock.ValidateStrict, landlock.FormatProfile,
-			stdout, stderr,
+			data, pickCheck(strict, landlock.Validate, landlock.ValidateStrict),
+			format, landlock.FormatProfile, stdout, stderr,
 		)
 	default:
 		_, _ = fmt.Fprintf(
@@ -125,10 +134,19 @@ func dispatchValidate(
 	}
 }
 
+// pickCheck selects the strict or the regular validation function.
+func pickCheck[T any](strict bool, validate, validateStrict func(*T) error) func(*T) error {
+	if strict {
+		return validateStrict
+	}
+
+	return validate
+}
+
 func validateProfiles[T any](
 	data [][]byte,
-	strict bool, format string,
-	validate, validateStrict func(*T) error,
+	check func(*T) error,
+	format string,
 	formatFn func(*T) string,
 	stdout, stderr io.Writer,
 ) int {
@@ -137,11 +155,6 @@ func validateProfiles[T any](
 		_, _ = fmt.Fprintf(stderr, "error: %v\n", err)
 
 		return 1
-	}
-
-	check := validate
-	if strict {
-		check = validateStrict
 	}
 
 	var failed bool
