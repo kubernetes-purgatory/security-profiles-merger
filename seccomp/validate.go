@@ -19,6 +19,7 @@ package seccomp
 import (
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
@@ -56,7 +57,27 @@ var (
 	// ErrDuplicateFlag is returned when the same flag appears more than
 	// once.
 	ErrDuplicateFlag = errors.New("duplicate seccomp flag")
+	// ErrNotifyNotAllowed is returned by ValidateArtifact when a profile
+	// uses SCMP_ACT_NOTIFY, which needs a listener that an artifact cannot
+	// provide.
+	ErrNotifyNotAllowed = errors.New("SCMP_ACT_NOTIFY is not allowed")
+	// ErrListenerNotAllowed is returned by ValidateArtifact when a profile
+	// sets listenerPath or listenerMetadata, which name node-local
+	// resources that an artifact must not control.
+	ErrListenerNotAllowed = errors.New("listener settings are not allowed")
+	// ErrTooManyEntries is returned by ValidateArtifact when one syscall
+	// name appears in more than MaxArtifactEntriesPerSyscall entries.
+	ErrTooManyEntries = errors.New("too many entries for syscall")
 )
+
+// MaxArtifactEntriesPerSyscall bounds how many entries may name the same
+// syscall in a profile accepted by ValidateArtifact. Intersect compares
+// every entry for a syscall against every entry for the same syscall in the
+// other profile, so the cost per syscall grows quadratically with the entry
+// count. Real profiles use a handful of argument-filtered entries per
+// syscall; the cap keeps a 1 MiB artifact from turning the merge into a
+// multi-second operation.
+const MaxArtifactEntriesPerSyscall = 128
 
 // Validate checks that a seccomp profile contains only known actions and
 // that every syscall entry has non-empty names. Intersect and Union run it
@@ -108,45 +129,124 @@ func Validate(profile *specs.LinuxSeccomp) error {
 // which permits this. ValidateStrict is intended for user-authored profiles
 // where duplicates are likely mistakes.
 func ValidateStrict(profile *specs.LinuxSeccomp) error {
-	var errs []error
+	return validateWith(profile, validateDuplicateNames, validateShape)
+}
 
-	err := Validate(profile)
-	if err != nil {
-		errs = append(errs, err)
-	}
+// ValidateArtifact validates a profile received from an untrusted source,
+// such as an OCI artifact pulled by a container runtime (KEP-6061). It
+// performs all checks from Validate and the shape checks from ValidateStrict
+// (unknown or duplicate architectures and flags, unknown arg operators, and
+// out-of-range arg indices), and rejects two things a distributed profile
+// must not control: SCMP_ACT_NOTIFY, because it needs a listener that only
+// the runtime can provide, and listenerPath or listenerMetadata, because they
+// name a node-local socket. Duplicate syscall names are allowed, as the OCI
+// runtime-spec permits them and Intersect handles them, but no syscall may
+// appear in more than MaxArtifactEntriesPerSyscall entries, which bounds the
+// merge cost. ValidateArtifact does not compare the profile against a
+// baseline; callers intersect the result with their baseline afterwards.
+func ValidateArtifact(profile *specs.LinuxSeccomp) error {
+	return validateWith(
+		profile,
+		validateShape,
+		validateNoNotify,
+		validateNoListener,
+		validateEntryCount,
+	)
+}
+
+type profileCheck func(profile *specs.LinuxSeccomp) error
+
+// validateWith runs Validate and, if the profile is non-nil, every check,
+// collecting all failures into one error.
+func validateWith(profile *specs.LinuxSeccomp, checks ...profileCheck) error {
+	errs := []error{Validate(profile)}
 
 	if profile == nil {
 		return errors.Join(errs...)
 	}
 
-	err = validateDuplicateSyscallNames(profile.Syscalls)
-	if err != nil {
-		errs = append(errs, err)
+	for _, check := range checks {
+		errs = append(errs, check(profile))
 	}
 
-	err = validateArchitectures(profile.Architectures)
-	if err != nil {
-		errs = append(errs, err)
+	return errors.Join(errs...)
+}
+
+// validateShape runs the checks shared by ValidateStrict and
+// ValidateArtifact that do not depend on trust: unknown or duplicate
+// architectures and flags, unknown arg operators, and out-of-range arg
+// indices.
+func validateShape(profile *specs.LinuxSeccomp) error {
+	return errors.Join(
+		validateArchitectures(profile.Architectures),
+		validateDuplicateArchitectures(profile.Architectures),
+		validateFlags(profile.Flags),
+		validateDuplicateFlags(profile.Flags),
+		validateSyscallArgs(profile.Syscalls),
+	)
+}
+
+func validateDuplicateNames(profile *specs.LinuxSeccomp) error {
+	return validateDuplicateSyscallNames(profile.Syscalls)
+}
+
+func validateNoNotify(profile *specs.LinuxSeccomp) error {
+	var errs []error
+
+	if profile.DefaultAction == specs.ActNotify {
+		errs = append(errs, fmt.Errorf(
+			"default action: %w", ErrNotifyNotAllowed,
+		))
 	}
 
-	err = validateDuplicateArchitectures(profile.Architectures)
-	if err != nil {
-		errs = append(errs, err)
+	for idx := range profile.Syscalls {
+		if profile.Syscalls[idx].Action == specs.ActNotify {
+			errs = append(errs, fmt.Errorf(
+				"syscall entry %d action: %w", idx, ErrNotifyNotAllowed,
+			))
+		}
 	}
 
-	err = validateFlags(profile.Flags)
-	if err != nil {
-		errs = append(errs, err)
+	return errors.Join(errs...)
+}
+
+func validateEntryCount(profile *specs.LinuxSeccomp) error {
+	counts := make(map[string]int)
+
+	for idx := range profile.Syscalls {
+		for _, name := range profile.Syscalls[idx].Names {
+			counts[name]++
+		}
 	}
 
-	err = validateDuplicateFlags(profile.Flags)
-	if err != nil {
-		errs = append(errs, err)
+	var errs []error
+
+	for _, name := range slices.Sorted(maps.Keys(counts)) {
+		if counts[name] > MaxArtifactEntriesPerSyscall {
+			errs = append(errs, fmt.Errorf(
+				"syscall %q: %w (%d, max %d)",
+				name, ErrTooManyEntries, counts[name],
+				MaxArtifactEntriesPerSyscall,
+			))
+		}
 	}
 
-	err = validateSyscallArgs(profile.Syscalls)
-	if err != nil {
-		errs = append(errs, err)
+	return errors.Join(errs...)
+}
+
+func validateNoListener(profile *specs.LinuxSeccomp) error {
+	var errs []error
+
+	if profile.ListenerPath != "" {
+		errs = append(errs, fmt.Errorf(
+			"listenerPath: %w", ErrListenerNotAllowed,
+		))
+	}
+
+	if profile.ListenerMetadata != "" {
+		errs = append(errs, fmt.Errorf(
+			"listenerMetadata: %w", ErrListenerNotAllowed,
+		))
 	}
 
 	return errors.Join(errs...)

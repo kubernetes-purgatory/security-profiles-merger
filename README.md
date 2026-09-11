@@ -54,8 +54,11 @@ go get sigs.k8s.io/security-profiles-merger
 ## Packages
 
 Each package provides `Intersect`, `Union`, `Validate`, `ValidateStrict`,
-`FormatProfile`, `Diff`, and `FormatDiff` functions. For the full API reference
-(functions, errors, types, and merge semantics), see [docs/api.md](docs/api.md).
+`FormatProfile`, `Diff`, and `FormatDiff` functions. The seccomp package also
+provides `ValidateArtifact` for profiles pulled from OCI artifacts
+([KEP-6061](https://github.com/kubernetes/enhancements/issues/6061)). For the
+full API reference (functions, errors, types, and merge semantics), see
+[docs/api.md](docs/api.md).
 
 - **[seccomp](docs/api.md#seccomp)** - Operates on `specs.LinuxSeccomp` from the
   [OCI runtime-spec](https://github.com/opencontainers/runtime-spec).
