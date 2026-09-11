@@ -1,8 +1,8 @@
 # Kubernetes Security Profiles Merger
 
-[![ci](https://github.com/saschagrunert/security-profiles-merger/actions/workflows/ci.yml/badge.svg)](https://github.com/saschagrunert/security-profiles-merger/actions/workflows/ci.yml)
-[![codecov](https://codecov.io/gh/saschagrunert/security-profiles-merger/graph/badge.svg)](https://codecov.io/gh/saschagrunert/security-profiles-merger)
-[![Go Reference](https://pkg.go.dev/badge/github.com/saschagrunert/security-profiles-merger.svg)](https://pkg.go.dev/github.com/saschagrunert/security-profiles-merger)
+[![ci](https://github.com/kubernetes-sigs/security-profiles-merger/actions/workflows/ci.yml/badge.svg)](https://github.com/kubernetes-sigs/security-profiles-merger/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/kubernetes-sigs/security-profiles-merger/graph/badge.svg)](https://codecov.io/gh/kubernetes-sigs/security-profiles-merger)
+[![Go Reference](https://pkg.go.dev/badge/sigs.k8s.io/security-profiles-merger.svg)](https://pkg.go.dev/sigs.k8s.io/security-profiles-merger)
 
 A standalone Go library for merging security profiles
 ([seccomp](https://man7.org/linux/man-pages/man2/seccomp.2.html),
@@ -48,7 +48,7 @@ This library provides core operations on security profiles:
 ## Installation
 
 ```
-go get github.com/saschagrunert/security-profiles-merger
+go get sigs.k8s.io/security-profiles-merger
 ```
 
 ## Packages
@@ -124,7 +124,7 @@ writing Go code.
 ### Install
 
 Download a pre-built binary from the
-[releases page](https://github.com/saschagrunert/security-profiles-merger/releases).
+[releases page](https://github.com/kubernetes-sigs/security-profiles-merger/releases).
 Each release includes cosign-signed checksums, SBOMs, and build provenance
 attestations.
 
@@ -135,20 +135,20 @@ To verify a downloaded binary:
 cosign verify-blob \
   --bundle checksums.txt.sigstore.json \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-  --certificate-identity-regexp 'github.com/saschagrunert/security-profiles-merger' \
+  --certificate-identity-regexp 'github.com/kubernetes-sigs/security-profiles-merger' \
   checksums.txt
 
 # Verify binary against signed checksums
 sha256sum -c checksums.txt
 
 # Or verify build provenance directly
-gh attestation verify spm_*_linux_amd64 -R saschagrunert/security-profiles-merger
+gh attestation verify spm_*_linux_amd64 -R kubernetes-sigs/security-profiles-merger
 ```
 
 Or install from source:
 
 ```
-go install github.com/saschagrunert/security-profiles-merger/cmd/spm@latest
+go install sigs.k8s.io/security-profiles-merger/cmd/spm@latest
 ```
 
 Or build statically from source:

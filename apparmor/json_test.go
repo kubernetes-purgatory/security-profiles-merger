@@ -21,7 +21,7 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/saschagrunert/security-profiles-merger/apparmor"
+	"sigs.k8s.io/security-profiles-merger/apparmor"
 )
 
 func TestJSONRoundTripFull(t *testing.T) {

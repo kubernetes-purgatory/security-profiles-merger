@@ -24,7 +24,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/saschagrunert/security-profiles-merger/seccomp"
+	"sigs.k8s.io/security-profiles-merger/seccomp"
 )
 
 func TestDiffErrors(t *testing.T) {

@@ -19,7 +19,7 @@ package apparmor_test
 import (
 	"testing"
 
-	"github.com/saschagrunert/security-profiles-merger/apparmor"
+	"sigs.k8s.io/security-profiles-merger/apparmor"
 )
 
 func TestProfileString(t *testing.T) {

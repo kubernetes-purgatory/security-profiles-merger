@@ -1,4 +1,4 @@
-module github.com/saschagrunert/security-profiles-merger
+module sigs.k8s.io/security-profiles-merger
 
 go 1.25.0
 

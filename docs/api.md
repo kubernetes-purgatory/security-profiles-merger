@@ -23,7 +23,7 @@
 <!-- /toc -->
 
 For full Go documentation, see the
-[pkg.go.dev reference](https://pkg.go.dev/github.com/saschagrunert/security-profiles-merger).
+[pkg.go.dev reference](https://pkg.go.dev/sigs.k8s.io/security-profiles-merger).
 
 ## seccomp
 
@@ -31,7 +31,7 @@ Seccomp profile merge operating on `specs.LinuxSeccomp` from the
 [OCI runtime-spec](https://github.com/opencontainers/runtime-spec).
 
 ```go
-import "github.com/saschagrunert/security-profiles-merger/seccomp"
+import "sigs.k8s.io/security-profiles-merger/seccomp"
 ```
 
 ### Functions
@@ -51,7 +51,7 @@ import "github.com/saschagrunert/security-profiles-merger/seccomp"
 | `Diff` | Structured diff between two profiles |
 | `FormatDiff` | Human-readable representation of a profile diff |
 
-See [pkg.go.dev](https://pkg.go.dev/github.com/saschagrunert/security-profiles-merger/seccomp)
+See [pkg.go.dev](https://pkg.go.dev/sigs.k8s.io/security-profiles-merger/seccomp)
 for full signatures and documentation.
 
 ### Types
@@ -59,7 +59,7 @@ for full signatures and documentation.
 Diff types (`ProfileDiff`, `ActionDiff`, `UintPtrDiff`, `StringDiff`,
 `SliceDiff`, `SyscallsDiff`, `SyscallEntry`, `SyscallChange`, `SyscallDetail`)
 are documented in the
-[package reference](https://pkg.go.dev/github.com/saschagrunert/security-profiles-merger/seccomp#ProfileDiff).
+[package reference](https://pkg.go.dev/sigs.k8s.io/security-profiles-merger/seccomp#ProfileDiff).
 
 `SyscallEntry` and `SyscallDetail` implement `fmt.Stringer` for human-readable
 formatting.
@@ -69,7 +69,7 @@ formatting.
 Sentinel errors (`ErrNoProfiles`, `ErrNilProfile`, `ErrUnknownAction`,
 `ErrEmptySyscallNames`, `ErrDuplicateSyscallName`, `ErrUnknownOperator`,
 `ErrArgIndexOutOfRange`, `ErrUnknownArch`, `ErrUnknownFlag`, etc.) are documented
-in the [package reference](https://pkg.go.dev/github.com/saschagrunert/security-profiles-merger/seccomp#pkg-variables).
+in the [package reference](https://pkg.go.dev/sigs.k8s.io/security-profiles-merger/seccomp#pkg-variables).
 
 ### Merge semantics
 
@@ -141,7 +141,7 @@ unknown actions with `ErrUnknownAction`.
 AppArmor profile merge using structured profile types defined in this package.
 
 ```go
-import "github.com/saschagrunert/security-profiles-merger/apparmor"
+import "sigs.k8s.io/security-profiles-merger/apparmor"
 ```
 
 ### Functions
@@ -157,7 +157,7 @@ import "github.com/saschagrunert/security-profiles-merger/apparmor"
 | `Diff` | Structured diff between two profiles |
 | `FormatDiff` | Human-readable representation of a profile diff |
 
-See [pkg.go.dev](https://pkg.go.dev/github.com/saschagrunert/security-profiles-merger/apparmor)
+See [pkg.go.dev](https://pkg.go.dev/sigs.k8s.io/security-profiles-merger/apparmor)
 for full signatures and documentation.
 
 ### Types
@@ -166,7 +166,7 @@ Core types (`Profile`, `CapabilityRules`, `ExecutableRules`, `FilesystemRules`,
 `NetworkRules`, `AllowedProtocols`) and diff types (`ProfileDiff`,
 `StringSliceDiff`, `FilesystemDiff`, `NetworkDiff`, `BoolPtrDiff`) are
 documented in the
-[package reference](https://pkg.go.dev/github.com/saschagrunert/security-profiles-merger/apparmor#Profile).
+[package reference](https://pkg.go.dev/sigs.k8s.io/security-profiles-merger/apparmor#Profile).
 
 `Profile`, `ExecutableRules`, `FilesystemRules`, `NetworkRules`, and
 `CapabilityRules` implement `fmt.Stringer` for human-readable formatting.
@@ -175,7 +175,7 @@ documented in the
 
 Sentinel errors (`ErrNoProfiles`, `ErrNilProfile`, `ErrDuplicatePath`,
 `ErrUnknownCapability`, `ErrDuplicateExecutablePath`, etc.) are documented
-in the [package reference](https://pkg.go.dev/github.com/saschagrunert/security-profiles-merger/apparmor#pkg-variables).
+in the [package reference](https://pkg.go.dev/sigs.k8s.io/security-profiles-merger/apparmor#pkg-variables).
 
 ### Glob patterns
 
@@ -219,7 +219,7 @@ no overlapping paths after intersection, the result is a non-nil empty
 Landlock profile merge for Linux unprivileged sandboxing rulesets.
 
 ```go
-import "github.com/saschagrunert/security-profiles-merger/landlock"
+import "sigs.k8s.io/security-profiles-merger/landlock"
 ```
 
 ### Functions
@@ -234,7 +234,7 @@ import "github.com/saschagrunert/security-profiles-merger/landlock"
 | `Diff` | Structured diff between two profiles |
 | `FormatDiff` | Human-readable representation of a profile diff |
 
-See [pkg.go.dev](https://pkg.go.dev/github.com/saschagrunert/security-profiles-merger/landlock)
+See [pkg.go.dev](https://pkg.go.dev/sigs.k8s.io/security-profiles-merger/landlock)
 for full signatures and documentation.
 
 ### Types
@@ -243,7 +243,7 @@ Core types (`Profile`, `FSAccessRight`, `NetAccessRight`, `ScopeRight`,
 `PathRule`, `NetRule`) and diff types (`ProfileDiff`, `RightsDiff`,
 `PathRulesDiff`, `PathRuleChange`, `NetRulesDiff`, `NetRuleChange`) are
 documented in the
-[package reference](https://pkg.go.dev/github.com/saschagrunert/security-profiles-merger/landlock#Profile).
+[package reference](https://pkg.go.dev/sigs.k8s.io/security-profiles-merger/landlock#Profile).
 
 `Profile`, `PathRule`, and `NetRule` implement `fmt.Stringer` for human-readable
 formatting.
@@ -253,7 +253,7 @@ formatting.
 Sentinel errors (`ErrNoProfiles`, `ErrNilProfile`, `ErrUnknownRight`,
 `ErrDuplicateRule`, `ErrEmptyPath`, `ErrInvalidPath`, `ErrUnhandledRight`,
 `ErrDuplicateRight`, `ErrRelativePath`, etc.) are documented in the
-[package reference](https://pkg.go.dev/github.com/saschagrunert/security-profiles-merger/landlock#pkg-variables).
+[package reference](https://pkg.go.dev/sigs.k8s.io/security-profiles-merger/landlock#pkg-variables).
 
 ### Handled access semantics
 

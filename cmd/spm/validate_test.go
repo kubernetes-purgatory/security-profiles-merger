@@ -25,8 +25,8 @@ import (
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 
-	"github.com/saschagrunert/security-profiles-merger/apparmor"
-	"github.com/saschagrunert/security-profiles-merger/landlock"
+	"sigs.k8s.io/security-profiles-merger/apparmor"
+	"sigs.k8s.io/security-profiles-merger/landlock"
 )
 
 func TestValidateErrors(t *testing.T) {

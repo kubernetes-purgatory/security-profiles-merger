@@ -23,7 +23,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/saschagrunert/security-profiles-merger/apparmor"
+	"sigs.k8s.io/security-profiles-merger/apparmor"
 )
 
 func capsFromMask(mask uint64) []string {

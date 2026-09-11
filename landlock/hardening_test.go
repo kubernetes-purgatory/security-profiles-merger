@@ -20,7 +20,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/saschagrunert/security-profiles-merger/landlock"
+	"sigs.k8s.io/security-profiles-merger/landlock"
 )
 
 // readFileProfile builds a profile handling read_file with the given rules.
