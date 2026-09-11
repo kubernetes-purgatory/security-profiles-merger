@@ -26,13 +26,29 @@ import (
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 )
 
-// sortedArgs returns a sorted copy of the argument filters.
+// canonicalArg returns the condition as a runtime evaluates it: libseccomp
+// reads valueTwo only for SCMP_CMP_MASKED_EQ, so it is cleared for every
+// other operator. Without this, conditions that differ only in an ignored
+// valueTwo would be treated as different filters.
+func canonicalArg(arg specs.LinuxSeccompArg) specs.LinuxSeccompArg {
+	if arg.Op != specs.OpMaskedEqual {
+		arg.ValueTwo = 0
+	}
+
+	return arg
+}
+
+// sortedArgs returns a sorted, canonical copy of the argument filters.
 func sortedArgs(args []specs.LinuxSeccompArg) []specs.LinuxSeccompArg {
 	if len(args) == 0 {
 		return nil
 	}
 
-	cloned := slices.Clone(args)
+	cloned := make([]specs.LinuxSeccompArg, len(args))
+	for idx, arg := range args {
+		cloned[idx] = canonicalArg(arg)
+	}
+
 	sortArgs(cloned)
 
 	return cloned
@@ -50,15 +66,23 @@ func sortArgs(args []specs.LinuxSeccompArg) {
 }
 
 // argsKey returns a canonical string for a set of argument filters so that
-// filters differing only in order compare equal. Empty args yield "".
+// filters differing only in order or in an ignored valueTwo compare equal.
+// Empty args yield "".
 func argsKey(args []specs.LinuxSeccompArg) string {
+	return sortedArgsKey(sortedArgs(args))
+}
+
+// sortedArgsKey formats args that are already sorted and canonical, as
+// clause args always are, without copying them first. It is the hot path of
+// the merge: every clause comparison and grouping goes through it.
+func sortedArgsKey(args []specs.LinuxSeccompArg) string {
 	if len(args) == 0 {
 		return ""
 	}
 
 	var builder strings.Builder
 
-	for _, arg := range sortedArgs(args) {
+	for _, arg := range args {
 		builder.WriteString(strconv.FormatUint(uint64(arg.Index), 10))
 		builder.WriteByte(':')
 		builder.WriteString(string(arg.Op))

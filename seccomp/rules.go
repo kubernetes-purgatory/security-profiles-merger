@@ -146,7 +146,7 @@ func entryClauses(entry *specs.LinuxSyscall) []clause {
 	for _, arg := range entry.Args {
 		next := base
 		next.errnoRet = merge.ClonePtr(entry.ErrnoRet)
-		next.args = []specs.LinuxSeccompArg{arg}
+		next.args = []specs.LinuxSeccompArg{canonicalArg(arg)}
 		clauses = append(clauses, next)
 	}
 
@@ -260,9 +260,15 @@ func (m ruleMerger) mergeRules(
 	conditional = append(conditional, m.adjustClauses(rightConds, leftConds, leftFallback)...)
 
 	if m.intersect {
-		for _, leftClause := range leftConds {
-			for _, rightClause := range rightConds {
-				args, ok := conjoinClauseArgs(leftClause.args, rightClause.args)
+		leftKeys := clauseKeys(leftConds)
+		rightKeys := clauseKeys(rightConds)
+
+		for leftIdx, leftClause := range leftConds {
+			for rightIdx, rightClause := range rightConds {
+				args, ok := conjoinClauseArgs(
+					leftClause.args, rightClause.args,
+					leftKeys[leftIdx], rightKeys[rightIdx],
+				)
 				if !ok {
 					continue
 				}
@@ -329,7 +335,7 @@ func (m ruleMerger) foldIntoFallback(fallback *clause, conditional []clause) []c
 	order := make([]string, 0, len(conditional))
 
 	for _, current := range conditional {
-		key := argsKey(current.args)
+		key := sortedArgsKey(current.args)
 
 		if existing, ok := byArgs[key]; ok {
 			byArgs[key] = lessRestrictiveClause(existing, current)
@@ -390,12 +396,38 @@ var complementOps = map[specs.LinuxSeccompOperator]specs.LinuxSeccompOperator{
 	specs.OpGreaterThan:  specs.OpLessEqual,
 }
 
+// keyedClause pairs a clause with its precomputed argument key so that
+// sorting does not rebuild the key on every comparison.
+type keyedClause struct {
+	key    string
+	clause clause
+}
+
 func sortClauses(clauses []clause) []clause {
-	slices.SortFunc(clauses, func(a, b clause) int {
-		return cmp.Compare(argsKey(a.args), argsKey(b.args))
+	keyed := make([]keyedClause, len(clauses))
+	for idx := range clauses {
+		keyed[idx] = keyedClause{key: sortedArgsKey(clauses[idx].args), clause: clauses[idx]}
+	}
+
+	slices.SortFunc(keyed, func(a, b keyedClause) int {
+		return cmp.Compare(a.key, b.key)
 	})
 
+	for idx := range keyed {
+		clauses[idx] = keyed[idx].clause
+	}
+
 	return clauses
+}
+
+// clauseKeys returns the argument key of every clause, computed once.
+func clauseKeys(clauses []clause) []string {
+	keys := make([]string, len(clauses))
+	for idx := range clauses {
+		keys[idx] = sortedArgsKey(clauses[idx].args)
+	}
+
+	return keys
 }
 
 // mergeFallback combines the fallback clauses of both sides. Intersection
@@ -484,12 +516,13 @@ func (m ruleMerger) adjustAgainstOthers(
 }
 
 // conjoinClauseArgs returns the filter matching the overlap of two
-// conditional clauses. Identical filters are kept as-is; otherwise the
-// filters must not be provably disjoint and must be conjoinable.
+// conditional clauses, given their precomputed argument keys. Identical
+// filters are kept as-is; otherwise the filters must not be provably
+// disjoint and must be conjoinable.
 func conjoinClauseArgs(
-	left, right []specs.LinuxSeccompArg,
+	left, right []specs.LinuxSeccompArg, leftKey, rightKey string,
 ) ([]specs.LinuxSeccompArg, bool) {
-	if argsKey(left) == argsKey(right) {
+	if leftKey == rightKey {
 		return slices.Clone(left), true
 	}
 
@@ -510,7 +543,7 @@ func (m ruleMerger) collapseClauses(clauses []clause, fallback *clause) []clause
 	order := make([]string, 0, len(clauses))
 
 	for _, current := range clauses {
-		key := argsKey(current.args)
+		key := sortedArgsKey(current.args)
 
 		existing, ok := byArgs[key]
 		if !ok {

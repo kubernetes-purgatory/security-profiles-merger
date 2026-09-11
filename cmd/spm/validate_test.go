@@ -463,3 +463,78 @@ func TestValidateAutoDetect(t *testing.T) {
 		t.Errorf("expected seccomp output, got: %s", stdout)
 	}
 }
+
+func TestValidateSeccompArtifactRejectsRuntimeRestrictions(t *testing.T) {
+	t.Parallel()
+
+	profile := &specs.LinuxSeccomp{
+		DefaultAction: specs.ActErrno,
+		ListenerPath:  "/run/agent.sock",
+		Syscalls: []specs.LinuxSyscall{
+			{Names: []string{testSyscallRead}, Action: specs.ActNotify},
+		},
+	}
+
+	file := writeTemp(t, marshal(t, profile))
+
+	code, _, stderr := runCapture(t, []string{
+		cmdValidate, flagType, typeSeccomp, "--artifact", file,
+	}, nil)
+
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+
+	for _, want := range []string{"SCMP_ACT_NOTIFY", "listenerPath"} {
+		if !strings.Contains(stderr, want) {
+			t.Errorf("stderr = %q, want mention of %s", stderr, want)
+		}
+	}
+}
+
+func TestValidateSeccompArtifactAcceptsDuplicates(t *testing.T) {
+	t.Parallel()
+
+	// Duplicate names fail --strict but are fine for an artifact.
+	profile := &specs.LinuxSeccomp{
+		DefaultAction: specs.ActErrno,
+		Syscalls: []specs.LinuxSyscall{
+			{Names: []string{testSyscallRead}, Action: specs.ActAllow},
+			{
+				Names:  []string{testSyscallRead},
+				Action: specs.ActAllow,
+				Args:   []specs.LinuxSeccompArg{{Index: 0, Value: 1, Op: specs.OpEqualTo}},
+			},
+		},
+	}
+
+	file := writeTemp(t, marshal(t, profile))
+
+	code, _, stderr := runCapture(t, []string{
+		cmdValidate, flagType, typeSeccomp, "--artifact", file,
+	}, nil)
+
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0: %s", code, stderr)
+	}
+}
+
+func TestValidateArtifactRequiresSeccomp(t *testing.T) {
+	t.Parallel()
+
+	file := writeTemp(t, marshal(t, &apparmor.Profile{
+		Executable: nil, Filesystem: nil, Network: nil, Capabilities: nil,
+	}))
+
+	code, _, stderr := runCapture(t, []string{
+		cmdValidate, flagType, typeAppArmor, "--artifact", file,
+	}, nil)
+
+	if code != exitUsage {
+		t.Fatalf("exit code = %d, want %d", code, exitUsage)
+	}
+
+	if !strings.Contains(stderr, "seccomp profiles only") {
+		t.Errorf("stderr = %q, want the seccomp-only message", stderr)
+	}
+}

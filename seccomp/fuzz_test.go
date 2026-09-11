@@ -373,8 +373,11 @@ func equalModuloErrnoRet(
 		return false
 	}
 
-	firstFlags := slices.Clone(first.Flags)
-	secondFlags := slices.Clone(second.Flags)
+	// SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV belongs to the listener and is
+	// taken from the first profile, like ListenerPath, so it is not
+	// commutative by design and is left out of the comparison.
+	firstFlags := slices.DeleteFunc(slices.Clone(first.Flags), isListenerFlag)
+	secondFlags := slices.DeleteFunc(slices.Clone(second.Flags), isListenerFlag)
 
 	slices.Sort(firstFlags)
 	slices.Sort(secondFlags)
@@ -398,6 +401,10 @@ func equalModuloErrnoRet(
 	}
 
 	return true
+}
+
+func isListenerFlag(flag specs.LinuxSeccompFlag) bool {
+	return flag == specs.LinuxSeccompFlagWaitKillableRecv
 }
 
 // syscallNames returns every syscall name mentioned by the profiles.

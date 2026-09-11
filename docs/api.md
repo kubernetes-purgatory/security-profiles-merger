@@ -45,9 +45,11 @@ import "sigs.k8s.io/security-profiles-merger/seccomp"
 | `DiffSyscalls` | Diff two bare syscall slices, returning added/removed/changed |
 | `MoreRestrictive` | Return the more restrictive of two seccomp actions |
 | `LessRestrictive` | Return the less restrictive of two seccomp actions |
+| `NativeArchitecture` | The seccomp architecture of the running program, from `runtime.GOARCH` |
+| `PopulateNativeArchitecture` | Set a profile's empty architecture list to the native architecture before merging |
 | `Validate` | Check for known actions and non-empty syscall names |
-| `ValidateStrict` | All Validate checks plus duplicates, unknown archs/flags/operators |
-| `ValidateArtifact` | Validate plus shape checks for untrusted OCI artifacts; rejects `SCMP_ACT_NOTIFY`, listener settings, and more than `MaxArtifactEntriesPerSyscall` entries per syscall; allows duplicates |
+| `ValidateStrict` | All Validate checks plus duplicates (reported once per name), unknown archs/flags/operators, out-of-range arg indices and errno values, and `valueTwo` on operators that ignore it |
+| `ValidateArtifact` | Validate plus the shape checks for untrusted OCI artifacts; rejects `SCMP_ACT_NOTIFY`, the listener settings (`listenerPath`, `listenerMetadata`, `SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV`), errno values above 4095, and more than `MaxArtifactEntriesPerSyscall` entries per syscall; allows duplicates and ignores `valueTwo` on non-masked operators |
 | `FormatProfile` | Human-readable representation of a seccomp profile |
 | `Diff` | Structured diff between two profiles |
 | `FormatDiff` | Human-readable representation of a profile diff |
@@ -69,7 +71,9 @@ formatting.
 
 Sentinel errors (`ErrNoProfiles`, `ErrNilProfile`, `ErrUnknownAction`,
 `ErrEmptySyscallNames`, `ErrDuplicateSyscallName`, `ErrUnknownOperator`,
-`ErrArgIndexOutOfRange`, `ErrUnknownArch`, `ErrUnknownFlag`, etc.) are documented
+`ErrArgIndexOutOfRange`, `ErrErrnoOutOfRange`, `ErrUnusedValueTwo`,
+`ErrUnknownArch`, `ErrUnknownFlag`, `ErrUnknownNativeArchitecture`, etc.) are
+documented
 in the [package reference](https://pkg.go.dev/sigs.k8s.io/security-profiles-merger/seccomp#pkg-variables).
 
 ### Merge semantics
@@ -81,11 +85,24 @@ in the [package reference](https://pkg.go.dev/sigs.k8s.io/security-profiles-merg
   defers to the other profile. Per the OCI runtime-spec, empty means "native
   architecture only", but the native architecture is unknown at merge time.
   Callers that need precise architecture intersection should populate the native
-  architecture explicitly before merging.
-- Flags: intersection keeps only flags present in all profiles; union combines
-  all. An empty flag list means "no flags", so intersecting with it yields no
-  flags. This keeps an OCI-pulled profile from enabling
-  `SECCOMP_FILTER_FLAG_SPEC_ALLOW` over a baseline that did not set it.
+  architecture explicitly before merging, for example with
+  `PopulateNativeArchitecture`. Two non-empty lists with no architecture in
+  common intersect to an empty list, which the runtime-spec again reads as
+  "native architecture only".
+- Flags are merged by what they do, so that a merged profile never loosens a
+  baseline. `SECCOMP_FILTER_FLAG_SPEC_ALLOW` disables a mitigation: intersection
+  keeps it only if every profile sets it, union if any does.
+  `SECCOMP_FILTER_FLAG_LOG` adds audit logging: intersection keeps it if any
+  profile sets it, union only if every profile does.
+  `SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV` only matters with a listener and is
+  taken from the first profile, like `listenerPath`. Unknown flags are treated
+  like `SECCOMP_FILTER_FLAG_LOG`. An empty flag list means "no flags".
+- Argument conditions are compared as runtimes evaluate them: `valueTwo` is only
+  read for `SCMP_CMP_MASKED_EQ` and is cleared for every other operator, so
+  conditions that differ only there are the same filter.
+- A single profile is normalized as if it were merged with itself, so
+  `Intersect(p)` and `Union(p)` follow the evaluation model below and are
+  deterministic.
 - Evaluation model: entries are evaluated the way runc and libseccomp load
   them. Entries whose action (and errno, for `ERRNO` and `TRACE`) equals the
   profile default are ignored. An unconditional entry applies to every call of
@@ -118,7 +135,9 @@ in the [package reference](https://pkg.go.dev/sigs.k8s.io/security-profiles-merg
   applies to matching calls. The result never denies a call that any input
   permits.
 - Output grouping: entries sharing the same action, errno, and argument filters
-  are emitted as one multi-name entry, sorted by name.
+  are emitted as one multi-name entry, sorted by first name, then by argument
+  filter, action, and errno, which is a total order, so equal inputs always
+  produce the same output.
 - `DefaultErrnoRet` is taken from whichever profile's default action is selected.
   When both profiles share the same action, the earlier (leftmost) profile's
   `DefaultErrnoRet` wins. The same applies to per-syscall `ErrnoRet`. `ErrnoRet`
