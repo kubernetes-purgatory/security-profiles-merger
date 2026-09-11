@@ -174,7 +174,7 @@ func TestDiffDefaultErrnoRet(t *testing.T) {
 	t.Parallel()
 
 	errnoA := uint(38)
-	errnoB := uint(1)
+	errnoB := uint(13)
 
 	left := &specs.LinuxSeccomp{
 		DefaultAction:   specs.ActErrno,
@@ -198,8 +198,43 @@ func TestDiffDefaultErrnoRet(t *testing.T) {
 		t.Errorf("left errno = %d, want 38", *diff.DefaultErrnoRet.Left)
 	}
 
-	if *diff.DefaultErrnoRet.Right != 1 {
-		t.Errorf("right errno = %d, want 1", *diff.DefaultErrnoRet.Right)
+	if *diff.DefaultErrnoRet.Right != 13 {
+		t.Errorf("right errno = %d, want 13", *diff.DefaultErrnoRet.Right)
+	}
+}
+
+func TestDiffErrnoRetUnsetEqualsEPERM(t *testing.T) {
+	t.Parallel()
+
+	// runc applies EPERM when errnoRet is unset, so spelling it out changes
+	// nothing, and errnoRet on an action that ignores it is not a
+	// difference either.
+	eperm := uint(1)
+	ignored := uint(13)
+
+	left := &specs.LinuxSeccomp{
+		DefaultAction: specs.ActErrno,
+		Syscalls: []specs.LinuxSyscall{
+			{Names: []string{syscallRead}, Action: specs.ActErrno, ErrnoRet: &eperm},
+			{Names: []string{syscallWrite}, Action: specs.ActAllow, ErrnoRet: &ignored},
+		},
+	}
+	right := &specs.LinuxSeccomp{
+		DefaultAction:   specs.ActErrno,
+		DefaultErrnoRet: &eperm,
+		Syscalls: []specs.LinuxSyscall{
+			{Names: []string{syscallRead}, Action: specs.ActErrno},
+			{Names: []string{syscallWrite}, Action: specs.ActAllow},
+		},
+	}
+
+	diff, err := seccomp.Diff(left, right)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if !diff.Equal {
+		t.Errorf("expected equal profiles, got %s", seccomp.FormatDiff(diff))
 	}
 }
 
@@ -451,7 +486,7 @@ func TestDiffSyscallArgsSameIndexDifferentValue(t *testing.T) {
 func TestDiffDefaultErrnoRetNilVsSet(t *testing.T) {
 	t.Parallel()
 
-	errnoVal := uint(1)
+	errnoVal := uint(13)
 
 	left := &specs.LinuxSeccomp{
 		DefaultAction:   specs.ActErrno,
@@ -475,8 +510,8 @@ func TestDiffDefaultErrnoRetNilVsSet(t *testing.T) {
 		t.Error("left should be nil")
 	}
 
-	if diff.DefaultErrnoRet.Right == nil || *diff.DefaultErrnoRet.Right != 1 {
-		t.Error("right should be 1")
+	if diff.DefaultErrnoRet.Right == nil || *diff.DefaultErrnoRet.Right != 13 {
+		t.Error("right should be 13")
 	}
 }
 

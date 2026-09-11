@@ -40,18 +40,18 @@ import "sigs.k8s.io/security-profiles-merger/seccomp"
 |----------|-------------|
 | `Intersect` | Merge profiles via intersection (most restrictive wins) |
 | `Union` | Merge profiles via union (least restrictive wins) |
-| `IntersectSyscalls` | Intersect two bare syscall slices without a DefaultAction |
-| `UnionSyscalls` | Union two bare syscall slices without a DefaultAction |
+| `IntersectSyscalls` | Intersect two bare syscall slices without a DefaultAction; errno values follow the Intersect rules |
+| `UnionSyscalls` | Union two bare syscall slices without a DefaultAction; errno values follow the Union rules |
 | `DiffSyscalls` | Diff two bare syscall slices, returning added/removed/changed |
 | `MoreRestrictive` | Return the more restrictive of two seccomp actions |
 | `LessRestrictive` | Return the less restrictive of two seccomp actions |
 | `NativeArchitecture` | The seccomp architecture of the running program, from `runtime.GOARCH` |
 | `PopulateNativeArchitecture` | Set a profile's empty architecture list to the native architecture before merging |
 | `Validate` | Check for known actions and non-empty syscall names |
-| `ValidateStrict` | All Validate checks plus duplicates (reported once per name), unknown archs/flags/operators, out-of-range arg indices and errno values, and `valueTwo` on operators that ignore it |
-| `ValidateArtifact` | Validate plus the shape checks for untrusted OCI artifacts; rejects `SCMP_ACT_NOTIFY`, the listener settings (`listenerPath`, `listenerMetadata`, `SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV`), errno values above 4095, and more than `MaxArtifactEntriesPerSyscall` entries per syscall; allows duplicates and ignores `valueTwo` on non-masked operators |
+| `ValidateStrict` | All Validate checks plus duplicates (reported once per name), unknown archs/flags/operators, out-of-range arg indices, errno values above 4095 on actions that return them, `valueTwo` on operators that ignore it, and `errnoRet` on actions that ignore it |
+| `ValidateArtifact` | Validate plus the shape checks for untrusted OCI artifacts; rejects `SCMP_ACT_NOTIFY`, the listener settings (`listenerPath`, `listenerMetadata`, `SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV`), errno values above 4095 on actions that return them, more than `MaxArtifactEntriesPerSyscall` entries per syscall, and conflicting entries for one syscall (same shape, different result); allows duplicates and ignores `valueTwo` and `errnoRet` where runtimes ignore them |
 | `FormatProfile` | Human-readable representation of a seccomp profile |
-| `Diff` | Structured diff between two profiles |
+| `Diff` | Structured diff between two profiles; errno values are compared as runtimes apply them |
 | `FormatDiff` | Human-readable representation of a profile diff |
 
 See [pkg.go.dev](https://pkg.go.dev/sigs.k8s.io/security-profiles-merger/seccomp)
@@ -72,6 +72,7 @@ formatting.
 Sentinel errors (`ErrNoProfiles`, `ErrNilProfile`, `ErrUnknownAction`,
 `ErrEmptySyscallNames`, `ErrDuplicateSyscallName`, `ErrUnknownOperator`,
 `ErrArgIndexOutOfRange`, `ErrErrnoOutOfRange`, `ErrUnusedValueTwo`,
+`ErrUnusedErrnoRet`, `ErrConflictingEntries`, `ErrDisjointArchitectures`,
 `ErrUnknownArch`, `ErrUnknownFlag`, `ErrUnknownNativeArchitecture`, etc.) are
 documented
 in the [package reference](https://pkg.go.dev/sigs.k8s.io/security-profiles-merger/seccomp#pkg-variables).
@@ -87,8 +88,9 @@ in the [package reference](https://pkg.go.dev/sigs.k8s.io/security-profiles-merg
   Callers that need precise architecture intersection should populate the native
   architecture explicitly before merging, for example with
   `PopulateNativeArchitecture`. Two non-empty lists with no architecture in
-  common intersect to an empty list, which the runtime-spec again reads as
-  "native architecture only".
+  common cannot be intersected: an empty result would again mean "native
+  architecture only", which neither input permits, so `Intersect` returns
+  `ErrDisjointArchitectures`.
 - Flags are merged by what they do, so that a merged profile never loosens a
   baseline. `SECCOMP_FILTER_FLAG_SPEC_ALLOW` disables a mitigation: intersection
   keeps it only if every profile sets it, union if any does.
@@ -140,12 +142,15 @@ in the [package reference](https://pkg.go.dev/sigs.k8s.io/security-profiles-merg
   produce the same output.
 - `DefaultErrnoRet` is taken from whichever profile's default action is selected.
   When both profiles share the same action, the earlier (leftmost) profile's
-  `DefaultErrnoRet` wins. The same applies to per-syscall `ErrnoRet`. `ErrnoRet`
-  is only significant for `ERRNO` and `TRACE`; on other actions it is ignored
-  when comparing entries. Because of the leftmost rule, whether a conditional
-  entry that shares the default action but not its errno survives can depend
-  on argument order, so results are order-independent in effect only for
-  profiles without errno values.
+  `DefaultErrnoRet` wins. The same applies to per-syscall `ErrnoRet`. Errno
+  values are compared the way runc and crun apply them: an unset `errnoRet`
+  on `ERRNO` or `TRACE` means EPERM, so `SCMP_ACT_ERRNO` and `SCMP_ACT_ERRNO`
+  with `errnoRet: 1` are the same rule, and `errnoRet` on any other action is
+  ignored. Results spell EPERM as an unset `errnoRet` and drop values from
+  actions that ignore them. Because of the leftmost rule, whether a
+  conditional entry that shares the default action but not its errno survives
+  can depend on argument order, so results are order-independent in effect
+  only for profiles without errno values.
 - `ListenerPath` and `ListenerMetadata` are taken from the first profile.
 
 **Action restrictiveness ordering** (most to least restrictive):
@@ -171,7 +176,7 @@ import "sigs.k8s.io/security-profiles-merger/apparmor"
 | `Intersect` | Merge via intersection; capabilities/paths intersected, network AND |
 | `Union` | Merge via union; all rules combined, network OR |
 | `Validate` | Check for cross-category path conflicts and known capabilities |
-| `ValidateStrict` | All Validate checks plus duplicate executables/libraries |
+| `ValidateStrict` | All Validate checks plus duplicate executables/libraries and glob patterns over the matcher's limits |
 | `FormatProfile` | Human-readable representation of an AppArmor profile |
 | `IsGlobPattern` | Report whether a path contains AppArmor glob tokens |
 | `Diff` | Structured diff between two profiles |
@@ -194,7 +199,8 @@ documented in the
 ### Errors
 
 Sentinel errors (`ErrNoProfiles`, `ErrNilProfile`, `ErrDuplicatePath`,
-`ErrUnknownCapability`, `ErrDuplicateExecutablePath`, etc.) are documented
+`ErrUnknownCapability`, `ErrDuplicateExecutablePath`, `ErrGlobTooComplex`,
+etc.) are documented
 in the [package reference](https://pkg.go.dev/sigs.k8s.io/security-profiles-merger/apparmor#pkg-variables).
 
 ### Glob patterns
@@ -207,14 +213,17 @@ AppArmor parser, `*` and `**` at the start of a path component match at least
 one character, so `/dir/**` does not match `/dir/` itself. A backslash escapes
 the following character, and an escaped literal such as `/etc/\*` is matched
 against globs as the file name `/etc/*`. Literal paths are cleaned but keep a
-trailing slash, which distinguishes a directory rule from a file rule. On
+trailing slash, which distinguishes a directory rule from a file rule.
+Profile paths are Linux paths, so cleaning uses slash semantics on every
+host. On
 intersection a literal path survives when a glob on the other side matches
 it, and two globs survive only when they are identical or one is the `**`
 expansion of a literal prefix containing the other's prefix (so `/etc/**`
 narrows to `/etc/*.conf` and to `/etc/foo/*.conf`). On union a glob prunes
 literals it matches; globs never prune other globs. Patterns longer than 4096
 bytes or with more than 100 alternatives in total never match, so they are
-dropped on intersection and kept verbatim on union.
+dropped on intersection and kept verbatim on union; `ValidateStrict` reports
+them with `ErrGlobTooComplex`.
 
 ### Nil vs empty semantics
 
@@ -265,6 +274,11 @@ Core types (`Profile`, `FSAccessRight`, `NetAccessRight`, `ScopeRight`,
 documented in the
 [package reference](https://pkg.go.dev/sigs.k8s.io/security-profiles-merger/landlock#Profile).
 
+The access rights mirror the Landlock UAPI, and each right's documentation
+names the Landlock ABI version that introduced it. The kernel rejects rights
+it does not know, so a profile should only use rights the target ABI
+supports.
+
 `Profile`, `PathRule`, and `NetRule` implement `fmt.Stringer` for human-readable
 formatting.
 
@@ -307,7 +321,9 @@ rights are not a subset of the handled access set. Merge results therefore
 pass `ValidateStrict` when the inputs use absolute paths.
 
 Paths are cleaned before merging and before duplicate detection in
-`Validate`, so `/etc` and `/etc/` are the same rule. Empty paths, paths that
+`Validate`, so `/etc` and `/etc/` are the same rule. Profile paths are Linux
+paths, so cleaning and the absolute-path check use slash semantics on every
+host. Empty paths, paths that
 clean to `.`, and paths containing NUL bytes are rejected. Intersect and Union
 deduplicate rules and rights within each input before validating it, so
 duplicates within one input are merged rather than rejected there.

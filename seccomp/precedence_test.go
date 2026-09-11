@@ -347,8 +347,9 @@ func TestIntersectKeepsLeftmostErrnoOverCollapsedConditional(t *testing.T) {
 
 	// The conditional allow collapses to ERRNO(38), the same result as the
 	// unconditional entry, so the entry stays unconditional and read keeps
-	// returning ENOSYS for every argument.
-	want := "Profile{default:SCMP_ACT_ERRNO defaultErrno:1 read->SCMP_ACT_ERRNO(errno:38)}"
+	// returning ENOSYS for every argument. The explicit EPERM default is
+	// spelled as unset, which runtimes read the same way.
+	want := "Profile{default:SCMP_ACT_ERRNO read->SCMP_ACT_ERRNO(errno:38)}"
 	if got := seccomp.FormatProfile(result); got != want {
 		t.Errorf("Intersect = %s, want %s", got, want)
 	}

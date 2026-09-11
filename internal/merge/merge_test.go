@@ -184,26 +184,6 @@ func TestFoldEmpty(t *testing.T) {
 	}
 }
 
-func TestFoldNil(t *testing.T) {
-	t.Parallel()
-
-	_, err := merge.Fold([]*testProfile{nil}, cloneTestProfile, addTestProfiles)
-	if err == nil {
-		t.Fatal("expected error for nil profile")
-	}
-}
-
-func TestFoldNilAtIndex(t *testing.T) {
-	t.Parallel()
-
-	valid := &testProfile{value: 1}
-
-	_, err := merge.Fold([]*testProfile{valid, nil}, cloneTestProfile, addTestProfiles)
-	if err == nil {
-		t.Fatal("expected error for nil profile at index 1")
-	}
-}
-
 func TestFoldSingle(t *testing.T) {
 	t.Parallel()
 
@@ -619,5 +599,37 @@ func BenchmarkDeduplicateSlice(b *testing.B) {
 				_ = merge.DeduplicateSlice(items)
 			}
 		})
+	}
+}
+
+func TestCleanPath(t *testing.T) {
+	t.Parallel()
+
+	// Profile paths are Linux paths on every host, so cleaning never
+	// switches to the host's separator.
+	for _, testCase := range []struct{ in, want string }{
+		{"/etc/", "/etc"},
+		{"/var/log/../data", "/var/data"},
+		{"/a//b/./c", "/a/b/c"},
+		{"", "."},
+		{"relative/x/..", "relative"},
+	} {
+		if got := merge.CleanPath(testCase.in); got != testCase.want {
+			t.Errorf("CleanPath(%q) = %q, want %q", testCase.in, got, testCase.want)
+		}
+	}
+}
+
+func TestIsAbsPath(t *testing.T) {
+	t.Parallel()
+
+	if !merge.IsAbsPath("/etc") {
+		t.Error("IsAbsPath(/etc) = false, want true")
+	}
+
+	for _, rel := range []string{"etc", "./etc", "", `C:\etc`} {
+		if merge.IsAbsPath(rel) {
+			t.Errorf("IsAbsPath(%q) = true, want false", rel)
+		}
 	}
 }

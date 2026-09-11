@@ -479,26 +479,7 @@ func TestValidateStrictAbsolutePathValid(t *testing.T) {
 func TestValidateAllKnownFSRights(t *testing.T) {
 	t.Parallel()
 
-	all := []landlock.FSAccessRight{
-		landlock.FSAccessExecute,
-		landlock.FSAccessWriteFile,
-		landlock.FSAccessReadFile,
-		landlock.FSAccessReadDir,
-		landlock.FSAccessRemoveDir,
-		landlock.FSAccessRemoveFile,
-		landlock.FSAccessMakeChar,
-		landlock.FSAccessMakeDir,
-		landlock.FSAccessMakeReg,
-		landlock.FSAccessMakeSock,
-		landlock.FSAccessMakeFIFO,
-		landlock.FSAccessMakeSym,
-		landlock.FSAccessMakeBlock,
-		landlock.FSAccessRefer,
-		landlock.FSAccessTruncate,
-		landlock.FSAccessIOCTLDev,
-		landlock.FSAccessResolveUnix,
-		landlock.FSAccessCreateTmp,
-	}
+	all := landlock.KnownFSRights()
 
 	profile := &landlock.Profile{
 		HandledAccessFS:  all,
@@ -517,14 +498,7 @@ func TestValidateAllKnownFSRights(t *testing.T) {
 func TestValidateAllKnownNetRights(t *testing.T) {
 	t.Parallel()
 
-	all := []landlock.NetAccessRight{
-		landlock.NetAccessBindTCP,
-		landlock.NetAccessConnectTCP,
-		landlock.NetAccessBindUDP,
-		landlock.NetAccessConnectSendUDP,
-		landlock.NetAccessListenTCP,
-		landlock.NetAccessAcceptTCP,
-	}
+	all := landlock.KnownNetRights()
 
 	profile := &landlock.Profile{
 		HandledAccessFS:  nil,
@@ -543,10 +517,7 @@ func TestValidateAllKnownNetRights(t *testing.T) {
 func TestValidateAllKnownScopeRights(t *testing.T) {
 	t.Parallel()
 
-	all := []landlock.ScopeRight{
-		landlock.ScopeAbstractUnixSocket,
-		landlock.ScopeSignal,
-	}
+	all := landlock.KnownScopeRights()
 
 	profile := &landlock.Profile{
 		HandledAccessFS:  nil,
@@ -706,5 +677,30 @@ func TestValidateDuplicatePathRuleRight(t *testing.T) {
 
 	if !errors.Is(err, landlock.ErrDuplicateRight) {
 		t.Errorf("expected ErrDuplicateRight, got: %v", err)
+	}
+}
+
+func TestValidateRejectsRightsUnknownToKernel(t *testing.T) {
+	t.Parallel()
+
+	// These names are not part of the Landlock UAPI, so the kernel would
+	// reject a ruleset using them; they must not count as known rights.
+	profile := &landlock.Profile{
+		HandledAccessFS:  []landlock.FSAccessRight{"create_tmp"},
+		HandledAccessNet: []landlock.NetAccessRight{"listen_tcp", "accept_tcp"},
+		Scoped:           nil,
+		PathRules:        nil,
+		NetRules:         nil,
+	}
+
+	err := landlock.Validate(profile)
+	if !errors.Is(err, landlock.ErrUnknownRight) {
+		t.Fatalf("expected ErrUnknownRight, got: %v", err)
+	}
+
+	for _, want := range []string{"create_tmp", "listen_tcp", "accept_tcp"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q should mention %s", err, want)
+		}
 	}
 }

@@ -172,20 +172,30 @@ func repeatsIndex(args []specs.LinuxSeccompArg) bool {
 	return false
 }
 
+// eperm is the errno runc encodes into an ERRNO or TRACE action whose
+// errnoRet is unset.
+const eperm uint = 1
+
+// loadedErrno returns the errno runc encodes into an action: the explicit
+// value or EPERM for ERRNO and TRACE, and none for every other action.
+func loadedErrno(action specs.LinuxSeccompAction, ret *uint) uint {
+	if action != specs.ActErrno && action != specs.ActTrace {
+		return 0
+	}
+
+	if ret == nil {
+		return eperm
+	}
+
+	return *ret
+}
+
+// equalsDefault reports whether runc skips the entry because its loaded
+// action, errno included, equals the profile default.
 func equalsDefault(profile *specs.LinuxSeccomp, entry specs.LinuxSyscall) bool {
-	if !sameRestrictiveness(entry.Action, profile.DefaultAction) {
-		return false
-	}
-
-	if entry.Action != specs.ActErrno && entry.Action != specs.ActTrace {
-		return true
-	}
-
-	if entry.ErrnoRet == nil || profile.DefaultErrnoRet == nil {
-		return entry.ErrnoRet == nil && profile.DefaultErrnoRet == nil
-	}
-
-	return *entry.ErrnoRet == *profile.DefaultErrnoRet
+	return sameRestrictiveness(entry.Action, profile.DefaultAction) &&
+		loadedErrno(entry.Action, entry.ErrnoRet) ==
+			loadedErrno(profile.DefaultAction, profile.DefaultErrnoRet)
 }
 
 // evalCall returns the action a profile applies to a call of the named

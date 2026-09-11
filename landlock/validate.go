@@ -19,7 +19,6 @@ package landlock
 import (
 	"errors"
 	"fmt"
-	"path/filepath"
 	"strings"
 
 	"sigs.k8s.io/security-profiles-merger/internal/merge"
@@ -130,9 +129,8 @@ func validateRights[T ~string](
 	return errors.Join(errs...)
 }
 
-// validateEmptyPathsBeforeNormalize catches empty paths before
-// filepath.Clean("") turns them into ".", so the error names the original
-// path.
+// validateEmptyPathsBeforeNormalize catches empty paths before cleaning
+// turns them into ".", so the error names the original path.
 func validateEmptyPathsBeforeNormalize(profile *Profile) error {
 	if profile == nil {
 		return ErrNilProfile
@@ -161,7 +159,7 @@ func validatePath(path string) error {
 		return fmt.Errorf("%q contains a NUL byte: %w", path, ErrInvalidPath)
 	}
 
-	if filepath.Clean(path) == "." {
+	if merge.CleanPath(path) == "." {
 		return fmt.Errorf("%q resolves to %q: %w", path, ".", ErrEmptyPath)
 	}
 
@@ -216,49 +214,21 @@ func validateNetRules(rules []NetRule) []error {
 }
 
 func isKnownFSRight(right FSAccessRight) bool {
-	switch right {
-	case FSAccessExecute,
-		FSAccessWriteFile,
-		FSAccessReadFile,
-		FSAccessReadDir,
-		FSAccessRemoveDir,
-		FSAccessRemoveFile,
-		FSAccessMakeChar,
-		FSAccessMakeDir,
-		FSAccessMakeReg,
-		FSAccessMakeSock,
-		FSAccessMakeFIFO,
-		FSAccessMakeSym,
-		FSAccessMakeBlock,
-		FSAccessRefer,
-		FSAccessTruncate,
-		FSAccessIOCTLDev,
-		FSAccessResolveUnix,
-		FSAccessCreateTmp:
-		return true
-	default:
-		return false
-	}
+	_, ok := fsAccessABI[right]
+
+	return ok
 }
 
 func isKnownScopeRight(right ScopeRight) bool {
-	switch right {
-	case ScopeAbstractUnixSocket, ScopeSignal:
-		return true
-	default:
-		return false
-	}
+	_, ok := scopeABI[right]
+
+	return ok
 }
 
 func isKnownNetRight(right NetAccessRight) bool {
-	switch right {
-	case NetAccessBindTCP, NetAccessConnectTCP,
-		NetAccessBindUDP, NetAccessConnectSendUDP,
-		NetAccessListenTCP, NetAccessAcceptTCP:
-		return true
-	default:
-		return false
-	}
+	_, ok := netAccessABI[right]
+
+	return ok
 }
 
 // validateDuplicatePaths detects rules for the same cleaned path, so that
@@ -270,7 +240,7 @@ func validateDuplicatePaths(rules []PathRule) error {
 	var errs []error
 
 	for _, rule := range rules {
-		cleaned := filepath.Clean(rule.Path)
+		cleaned := merge.CleanPath(rule.Path)
 
 		if _, ok := seen[cleaned]; ok {
 			errs = append(errs, fmt.Errorf("path %q: %w", rule.Path, ErrDuplicateRule))
@@ -308,7 +278,7 @@ func ValidateStrict(profile *Profile) error {
 	handledNet := toSet(profile.HandledAccessNet)
 
 	for idx, rule := range profile.PathRules {
-		if rule.Path != "" && !filepath.IsAbs(rule.Path) {
+		if rule.Path != "" && !merge.IsAbsPath(rule.Path) {
 			errs = append(errs, fmt.Errorf(
 				"PathRules[%d]: %q: %w", idx, rule.Path, ErrRelativePath,
 			))

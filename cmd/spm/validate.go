@@ -17,15 +17,12 @@ limitations under the License.
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
-
-	"sigs.k8s.io/security-profiles-merger/apparmor"
-	"sigs.k8s.io/security-profiles-merger/landlock"
-	"sigs.k8s.io/security-profiles-merger/seccomp"
 )
 
 const validateUsage = `Usage: spm validate [options] [files...]
@@ -49,7 +46,10 @@ func runValidate(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	profileType := flags.String(
 		"type", "", "profile type: seccomp, apparmor, landlock (auto-detected if omitted)",
 	)
-	strict := flags.Bool("strict", false, "use strict validation")
+	strict := flags.Bool(
+		"strict", false,
+		"use strict validation, which also rejects unknown fields (not with --artifact)",
+	)
 	artifact := flags.Bool(
 		"artifact", false,
 		"validate as an untrusted OCI artifact the way container runtimes do (seccomp only)",
@@ -66,11 +66,7 @@ func runValidate(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return exitUsage
 	}
 
-	if code := validateFormat(*format, stderr); code != 0 {
-		return code
-	}
-
-	if code := validateProfileType(*profileType, stderr); code != 0 {
+	if code := validateValidateFlags(*profileType, *format, *strict, *artifact, stderr); code != 0 {
 		return code
 	}
 
@@ -81,76 +77,68 @@ func runValidate(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return 1
 	}
 
-	if code := resolveProfileType(profileType, data, stderr); code != 0 {
-		return code
-	}
-
-	outWriter, cleanup, code := openOutput(*output, stdout, stderr)
+	kind, code := resolveKind(*profileType, data, stderr)
 	if code != 0 {
 		return code
 	}
 
-	defer cleanup()
+	var out bytes.Buffer
 
-	return dispatchValidate(data, *profileType, *strict, *artifact, *format, outWriter, stderr)
-}
-
-func dispatchValidate(
-	data [][]byte, profileType string, strict, artifact bool, format string,
-	stdout, stderr io.Writer,
-) int {
-	if artifact && profileType != typeSeccomp {
-		_, _ = fmt.Fprintln(stderr, "error: --artifact applies to seccomp profiles only")
-
-		return exitUsage
+	code = kind.validate(data, modeFromFlags(*strict, *artifact), *format, &out, stderr)
+	if code != 0 {
+		return code
 	}
 
-	switch profileType {
-	case typeSeccomp:
-		check := pickCheck(strict, seccomp.Validate, seccomp.ValidateStrict)
-		if artifact {
-			check = seccomp.ValidateArtifact
-		}
+	return flushOutput(*output, out.Bytes(), stdout, stderr)
+}
 
-		return validateProfiles(data, check, format, seccomp.FormatProfile, stdout, stderr)
-	case typeAppArmor:
-		return validateProfiles(
-			data, pickCheck(strict, apparmor.Validate, apparmor.ValidateStrict),
-			format, apparmor.FormatProfile, stdout, stderr,
-		)
-	case typeLandlock:
-		return validateProfiles(
-			data, pickCheck(strict, landlock.Validate, landlock.ValidateStrict),
-			format, landlock.FormatProfile, stdout, stderr,
-		)
+// modeFromFlags maps the validate flags to a mode; the flags have already
+// been checked not to be set together.
+func modeFromFlags(strict, artifact bool) validateMode {
+	switch {
+	case artifact:
+		return modeArtifact
+	case strict:
+		return modeStrict
 	default:
-		_, _ = fmt.Fprintf(
-			stderr,
-			"error: unknown type %q (use seccomp, apparmor, or landlock)\n",
-			profileType,
+		return modeDefault
+	}
+}
+
+func validateValidateFlags(
+	profileType, format string, strict, artifact bool, stderr io.Writer,
+) int {
+	if code := validateFormat(format, stderr); code != 0 {
+		return code
+	}
+
+	if code := validateProfileType(profileType, stderr); code != 0 {
+		return code
+	}
+
+	if strict && artifact {
+		_, _ = fmt.Fprintln(
+			stderr, "error: --strict cannot be combined with --artifact",
 		)
 
 		return exitUsage
 	}
+
+	return 0
 }
 
-// pickCheck selects the strict or the regular validation function.
-func pickCheck[T any](strict bool, validate, validateStrict func(*T) error) func(*T) error {
-	if strict {
-		return validateStrict
-	}
-
-	return validate
-}
-
+// validateProfiles decodes and checks every profile. With rejectUnknown set,
+// as under --strict, members the profile type does not know are errors
+// rather than warnings.
 func validateProfiles[T any](
 	data [][]byte,
 	check func(*T) error,
+	rejectUnknown bool,
 	format string,
 	formatFn func(*T) string,
 	stdout, stderr io.Writer,
 ) int {
-	profiles, err := unmarshalAll[T](data)
+	profiles, err := unmarshalAll[T](data, rejectUnknown, stderr)
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "error: %v\n", err)
 

@@ -17,6 +17,7 @@ limitations under the License.
 package seccomp_test
 
 import (
+	"errors"
 	"slices"
 	"testing"
 
@@ -300,6 +301,10 @@ func fuzzMerge(
 	)
 
 	result, err := cfg.merge(left, right)
+	if errors.Is(err, seccomp.ErrDisjointArchitectures) {
+		t.Skip("disjoint architectures cannot be intersected")
+	}
+
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -624,3 +624,51 @@ func TestValidateMixedCaseCapabilities(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
+
+func TestValidateStrictGlobTooComplex(t *testing.T) {
+	t.Parallel()
+
+	tooLong := "/tmp/" + strings.Repeat("a", 4096) + "/*"
+	tooManyAlternatives := "/tmp/" + strings.Repeat("{a,b}", 51) + "/**"
+
+	profile := &apparmor.Profile{
+		Executable: &apparmor.ExecutableRules{
+			AllowedExecutables: []string{tooLong},
+			AllowedLibraries:   nil,
+		},
+		Filesystem: &apparmor.FilesystemRules{
+			ReadOnlyPaths:  []string{"/etc/passwd", tooManyAlternatives},
+			WriteOnlyPaths: nil,
+			ReadWritePaths: nil,
+		},
+		Network:      nil,
+		Capabilities: nil,
+	}
+
+	err := apparmor.ValidateStrict(profile)
+	if !errors.Is(err, apparmor.ErrGlobTooComplex) {
+		t.Fatalf("expected ErrGlobTooComplex, got: %v", err)
+	}
+
+	for _, want := range []string{"AllowedExecutables[0]", "ReadOnlyPaths[1]"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q should mention %s", err, want)
+		}
+	}
+
+	// The merge path tolerates such patterns: intersection drops them.
+	err = apparmor.Validate(profile)
+	if err != nil {
+		t.Errorf("Validate should accept unmatchable globs: %v", err)
+	}
+
+	result, err := apparmor.Intersect(profile, profile)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	want := "Profile{r:/etc/passwd}"
+	if got := apparmor.FormatProfile(result); got != want {
+		t.Errorf("Intersect = %s, want %s", got, want)
+	}
+}

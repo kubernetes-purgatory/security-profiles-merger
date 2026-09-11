@@ -17,14 +17,11 @@ limitations under the License.
 package main
 
 import (
+	"bytes"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
-
-	"sigs.k8s.io/security-profiles-merger/apparmor"
-	"sigs.k8s.io/security-profiles-merger/landlock"
-	"sigs.k8s.io/security-profiles-merger/seccomp"
 )
 
 const (
@@ -83,18 +80,25 @@ func runDiff(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return exitUsage
 	}
 
-	if code := resolveProfileType(profileType, data, stderr); code != 0 {
-		return code
-	}
-
-	outWriter, cleanup, code := openOutput(*output, stdout, stderr)
+	kind, code := resolveKind(*profileType, data, stderr)
 	if code != 0 {
 		return code
 	}
 
-	defer cleanup()
+	var out bytes.Buffer
 
-	return dispatchDiff(data, *profileType, *format, outWriter, stderr)
+	code = kind.diff(data, *format, &out, stderr)
+	if code != 0 && code != exitDiff {
+		return code
+	}
+
+	// Exit code 1 means "different" for diff, so a failed flush is a usage
+	// error like every other diff failure.
+	if flushOutput(*output, out.Bytes(), stdout, stderr) != 0 {
+		return exitUsage
+	}
+
+	return code
 }
 
 func readDiffInputs(
@@ -141,27 +145,6 @@ type equalChecker interface {
 	IsEqual() bool
 }
 
-func dispatchDiff(
-	data [][]byte, profileType, format string, stdout, stderr io.Writer,
-) int {
-	switch profileType {
-	case typeSeccomp:
-		return diffProfiles(data, format, seccomp.Diff, seccomp.FormatDiff, stdout, stderr)
-	case typeAppArmor:
-		return diffProfiles(data, format, apparmor.Diff, apparmor.FormatDiff, stdout, stderr)
-	case typeLandlock:
-		return diffProfiles(data, format, landlock.Diff, landlock.FormatDiff, stdout, stderr)
-	default:
-		_, _ = fmt.Fprintf(
-			stderr,
-			"error: unknown type %q (use seccomp, apparmor, or landlock)\n",
-			profileType,
-		)
-
-		return exitUsage
-	}
-}
-
 func diffProfiles[T any, D equalChecker](
 	data [][]byte,
 	format string,
@@ -169,7 +152,7 @@ func diffProfiles[T any, D equalChecker](
 	formatFn func(*D) string,
 	stdout, stderr io.Writer,
 ) int {
-	profiles, err := unmarshalAll[T](data)
+	profiles, err := unmarshalAll[T](data, false, stderr)
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "error: %v\n", err)
 

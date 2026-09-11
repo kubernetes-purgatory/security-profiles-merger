@@ -18,6 +18,7 @@ package seccomp_test
 
 import (
 	"cmp"
+	"errors"
 	"slices"
 	"testing"
 
@@ -783,11 +784,11 @@ func TestIntersectErrnoRet(t *testing.T) {
 
 	left := &specs.LinuxSeccomp{
 		DefaultAction:   specs.ActErrno,
-		DefaultErrnoRet: uintPtr(1),
+		DefaultErrnoRet: uintPtr(13),
 	}
 
 	right := &specs.LinuxSeccomp{
-		DefaultAction:   specs.ActAllow,
+		DefaultAction:   specs.ActTrace,
 		DefaultErrnoRet: uintPtr(2),
 	}
 
@@ -796,8 +797,8 @@ func TestIntersectErrnoRet(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	if result.DefaultErrnoRet == nil || *result.DefaultErrnoRet != 1 {
-		t.Errorf("DefaultErrnoRet = %v, want 1", result.DefaultErrnoRet)
+	if result.DefaultErrnoRet == nil || *result.DefaultErrnoRet != 13 {
+		t.Errorf("DefaultErrnoRet = %v, want 13", result.DefaultErrnoRet)
 	}
 }
 
@@ -806,11 +807,11 @@ func TestUnionErrnoRet(t *testing.T) {
 
 	left := &specs.LinuxSeccomp{
 		DefaultAction:   specs.ActErrno,
-		DefaultErrnoRet: uintPtr(1),
+		DefaultErrnoRet: uintPtr(13),
 	}
 
 	right := &specs.LinuxSeccomp{
-		DefaultAction:   specs.ActAllow,
+		DefaultAction:   specs.ActTrace,
 		DefaultErrnoRet: uintPtr(2),
 	}
 
@@ -824,13 +825,82 @@ func TestUnionErrnoRet(t *testing.T) {
 	}
 }
 
+func TestMergeDropsErrnoRetIgnoredByAction(t *testing.T) {
+	t.Parallel()
+
+	// Runtimes only read errnoRet for ERRNO and TRACE, so a value on any
+	// other action does not survive a merge.
+	left := &specs.LinuxSeccomp{
+		DefaultAction:   specs.ActAllow,
+		DefaultErrnoRet: uintPtr(2),
+		Syscalls: []specs.LinuxSyscall{
+			{Names: []string{syscallRead}, Action: specs.ActLog, ErrnoRet: uintPtr(13)},
+		},
+	}
+
+	for _, mergeFn := range []func(...*specs.LinuxSeccomp) (*specs.LinuxSeccomp, error){
+		seccomp.Intersect, seccomp.Union,
+	} {
+		result, err := mergeFn(left)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		want := "Profile{default:SCMP_ACT_ALLOW read->SCMP_ACT_LOG}"
+		if got := seccomp.FormatProfile(result); got != want {
+			t.Errorf("got %s, want %s", got, want)
+		}
+	}
+}
+
+func TestMergeTreatsUnsetErrnoRetAsEPERM(t *testing.T) {
+	t.Parallel()
+
+	// runc applies EPERM when errnoRet is unset, so an entry spelling it
+	// out equals the default and is elided, and the result spells EPERM as
+	// unset again.
+	profiles := []*specs.LinuxSeccomp{
+		{
+			DefaultAction: specs.ActErrno,
+			Syscalls: []specs.LinuxSyscall{
+				{Names: []string{syscallRead}, Action: specs.ActErrno, ErrnoRet: uintPtr(1)},
+				{Names: []string{syscallWrite}, Action: specs.ActAllow},
+			},
+		},
+		{
+			DefaultAction:   specs.ActErrno,
+			DefaultErrnoRet: uintPtr(1),
+			Syscalls: []specs.LinuxSyscall{
+				{Names: []string{syscallRead}, Action: specs.ActErrno},
+				{Names: []string{syscallWrite}, Action: specs.ActAllow},
+			},
+		},
+	}
+
+	for _, profile := range profiles {
+		for _, mergeFn := range []func(...*specs.LinuxSeccomp) (*specs.LinuxSeccomp, error){
+			seccomp.Intersect, seccomp.Union,
+		} {
+			result, err := mergeFn(profile)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			want := "Profile{default:SCMP_ACT_ERRNO write->SCMP_ACT_ALLOW}"
+			if got := seccomp.FormatProfile(result); got != want {
+				t.Errorf("got %s, want %s", got, want)
+			}
+		}
+	}
+}
+
 func TestUnionSyscallErrnoRetTiebreak(t *testing.T) {
 	t.Parallel()
 
 	left := &specs.LinuxSeccomp{
 		DefaultAction: specs.ActAllow,
 		Syscalls: []specs.LinuxSyscall{
-			{Names: []string{syscallRead}, Action: specs.ActErrno, ErrnoRet: uintPtr(1)},
+			{Names: []string{syscallRead}, Action: specs.ActErrno, ErrnoRet: uintPtr(13)},
 		},
 	}
 
@@ -850,8 +920,8 @@ func TestUnionSyscallErrnoRetTiebreak(t *testing.T) {
 		t.Fatalf("expected 1 syscall, got %d", len(result.Syscalls))
 	}
 
-	if result.Syscalls[0].ErrnoRet == nil || *result.Syscalls[0].ErrnoRet != 1 {
-		t.Errorf("ErrnoRet = %v, want 1 (leftmost wins)", result.Syscalls[0].ErrnoRet)
+	if result.Syscalls[0].ErrnoRet == nil || *result.Syscalls[0].ErrnoRet != 13 {
+		t.Errorf("ErrnoRet = %v, want 13 (leftmost wins)", result.Syscalls[0].ErrnoRet)
 	}
 }
 
@@ -1052,7 +1122,7 @@ func TestIntersectSyscallWithErrnoRet(t *testing.T) {
 	left := &specs.LinuxSeccomp{
 		DefaultAction: specs.ActAllow,
 		Syscalls: []specs.LinuxSyscall{
-			{Names: []string{syscallRead}, Action: specs.ActErrno, ErrnoRet: uintPtr(1)},
+			{Names: []string{syscallRead}, Action: specs.ActErrno, ErrnoRet: uintPtr(13)},
 		},
 	}
 
@@ -1074,8 +1144,8 @@ func TestIntersectSyscallWithErrnoRet(t *testing.T) {
 				t.Errorf("read action = %q, want %q", syscall.Action, specs.ActErrno)
 			}
 
-			if syscall.ErrnoRet == nil || *syscall.ErrnoRet != 1 {
-				t.Errorf("read ErrnoRet = %v, want 1", syscall.ErrnoRet)
+			if syscall.ErrnoRet == nil || *syscall.ErrnoRet != 13 {
+				t.Errorf("read ErrnoRet = %v, want 13", syscall.ErrnoRet)
 			}
 
 			return
@@ -1271,7 +1341,7 @@ func TestIntersectSyscallErrnoRetTieBreaking(t *testing.T) {
 	left := &specs.LinuxSeccomp{
 		DefaultAction: specs.ActAllow,
 		Syscalls: []specs.LinuxSyscall{
-			{Names: []string{syscallRead}, Action: specs.ActErrno, ErrnoRet: uintPtr(1)},
+			{Names: []string{syscallRead}, Action: specs.ActErrno, ErrnoRet: uintPtr(13)},
 		},
 	}
 
@@ -1289,9 +1359,9 @@ func TestIntersectSyscallErrnoRetTieBreaking(t *testing.T) {
 
 	for _, syscall := range result.Syscalls {
 		if slices.Contains(syscall.Names, syscallRead) {
-			if syscall.ErrnoRet == nil || *syscall.ErrnoRet != 1 {
+			if syscall.ErrnoRet == nil || *syscall.ErrnoRet != 13 {
 				t.Errorf(
-					"read ErrnoRet = %v, want 1 (leftmost wins when actions are equal)",
+					"read ErrnoRet = %v, want 13 (leftmost wins when actions are equal)",
 					syscall.ErrnoRet,
 				)
 			}
@@ -2463,7 +2533,7 @@ func TestMergeResultPassesValidation(t *testing.T) {
 	right := &specs.LinuxSeccomp{
 		DefaultAction:   specs.ActKillProcess,
 		DefaultErrnoRet: uintPtr(2),
-		Architectures:   []specs.Arch{specs.ArchARM},
+		Architectures:   []specs.Arch{specs.ArchARM, specs.ArchX86_64},
 		Flags:           []specs.LinuxSeccompFlag{specs.LinuxSeccompFlagSpecAllow},
 		Syscalls: []specs.LinuxSyscall{
 			{Names: []string{syscallRead}, Action: specs.ActLog},
@@ -2678,13 +2748,20 @@ func TestIntersectArchitecturesDisjoint(t *testing.T) {
 		Architectures: []specs.Arch{specs.ArchAARCH64},
 	}
 
-	result, err := seccomp.Intersect(left, right)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	// An empty list would mean "native architecture only", which neither
+	// input permits, so the merge refuses instead.
+	_, err := seccomp.Intersect(left, right)
+	if !errors.Is(err, seccomp.ErrDisjointArchitectures) {
+		t.Fatalf("expected ErrDisjointArchitectures, got: %v", err)
 	}
 
-	if len(result.Architectures) != 0 {
-		t.Errorf("architectures = %v, want empty", result.Architectures)
+	union, err := seccomp.Union(left, right)
+	if err != nil {
+		t.Fatalf("unexpected union error: %v", err)
+	}
+
+	if len(union.Architectures) != 2 {
+		t.Errorf("union architectures = %v, want both", union.Architectures)
 	}
 }
 
@@ -2823,6 +2900,33 @@ func assertDeterministic(
 
 		if got := seccomp.FormatProfile(again); got != want {
 			t.Fatalf("output not deterministic: %s vs %s", got, want)
+		}
+	}
+}
+
+func TestBareSyscallMergesSpellErrnoLikeProfiles(t *testing.T) {
+	t.Parallel()
+
+	// The bare-slice functions apply the same errno rules as Intersect and
+	// Union: EPERM is spelled as unset and errnoRet on actions that ignore
+	// it is dropped.
+	entries := []specs.LinuxSyscall{
+		{Names: []string{syscallRead}, Action: specs.ActErrno, ErrnoRet: uintPtr(1)},
+		{Names: []string{syscallWrite}, Action: specs.ActLog, ErrnoRet: uintPtr(13)},
+	}
+
+	for _, result := range [][]specs.LinuxSyscall{
+		seccomp.UnionSyscalls(entries, nil),
+		seccomp.IntersectSyscalls(entries, entries),
+	} {
+		if len(result) != 2 {
+			t.Fatalf("expected 2 entries, got %d", len(result))
+		}
+
+		for _, entry := range result {
+			if entry.ErrnoRet != nil {
+				t.Errorf("%v: ErrnoRet = %d, want unset", entry.Names, *entry.ErrnoRet)
+			}
 		}
 	}
 }

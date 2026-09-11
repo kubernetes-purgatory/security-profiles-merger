@@ -38,8 +38,9 @@ The codebase is organized in three layers:
   `internal/merge/`. The seccomp package merges syscalls through a clause
   model (`rules.go`, `args.go`) that reasons about argument filter regions.
 - `cmd/spm/` is a thin CLI layer that wires the packages together using Go
-  generics. It uses the standard library `flag` package with manual subcommand
-  dispatch.
+  generics: `kinds.go` registers each profile type's functions once, and the
+  merge, validate, and diff commands dispatch through that registry. It uses
+  the standard library `flag` package with manual subcommand dispatch.
 
 ## Local Development
 
@@ -47,7 +48,7 @@ The codebase is organized in three layers:
 make                     # build, lint, and test (default target)
 make help                # display available targets
 make build               # build the spm binary (static)
-make test                # run tests with race detection and coverage
+make test                # run tests with race detection and coverage (RACE= skips the race detector)
 make lint                # run golangci-lint
 make fuzz                # run all fuzz tests (default 30s, set FUZZTIME to adjust)
 make bench               # run benchmarks

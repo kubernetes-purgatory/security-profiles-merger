@@ -98,34 +98,31 @@ func detectProfileType(data [][]byte) string {
 	return ""
 }
 
-func openOutput(
-	path string, defaultWriter io.Writer, stderr io.Writer,
-) (io.Writer, func(), int) {
+// flushOutput writes a command's result to stdout, or to the output file when
+// a path is given. Commands buffer their result and flush it only once they
+// have succeeded, so a failed run never truncates an existing file.
+func flushOutput(path string, content []byte, stdout, stderr io.Writer) int {
 	if path == "" {
-		return defaultWriter, func() {}, 0
+		_, err := stdout.Write(content)
+		if err != nil {
+			_, _ = fmt.Fprintf(stderr, "error: writing output: %v\n", err)
+
+			return 1
+		}
+
+		return 0
 	}
 
 	const ownerReadWrite = 0o600
 
-	file, err := os.OpenFile(
-		filepath.Clean(path),
-		os.O_WRONLY|os.O_CREATE|os.O_TRUNC,
-		ownerReadWrite,
-	)
+	err := os.WriteFile(filepath.Clean(path), content, ownerReadWrite)
 	if err != nil {
-		_, _ = fmt.Fprintf(stderr, "error: creating output file: %v\n", err)
+		_, _ = fmt.Fprintf(stderr, "error: writing output file: %v\n", err)
 
-		return nil, func() {}, 1
+		return 1
 	}
 
-	cleanup := func() {
-		err := file.Close()
-		if err != nil {
-			_, _ = fmt.Fprintf(stderr, "error: closing output file: %v\n", err)
-		}
-	}
-
-	return file, cleanup, 0
+	return 0
 }
 
 func validateFormat(format string, stderr io.Writer) int {
@@ -141,43 +138,13 @@ func validateFormat(format string, stderr io.Writer) int {
 }
 
 func validateProfileType(profileType string, stderr io.Writer) int {
-	if profileType != "" &&
-		profileType != typeSeccomp &&
-		profileType != typeAppArmor &&
-		profileType != typeLandlock {
-		_, _ = fmt.Fprintf(
-			stderr,
-			"error: unknown type %q (use seccomp, apparmor, or landlock)\n",
-			profileType,
-		)
-
-		return exitUsage
-	}
-
-	return 0
-}
-
-func resolveProfileType(
-	profileType *string, data [][]byte, stderr io.Writer,
-) int {
-	if *profileType != "" {
+	if profileType == "" {
 		return 0
 	}
 
-	*profileType = detectProfileType(data)
-
-	if *profileType == "" {
-		_, _ = fmt.Fprintln(
-			stderr,
-			"error: could not detect profile type from input, use --type",
-		)
-
-		return exitUsage
+	if _, ok := kindByName(profileType); !ok {
+		return unknownType(stderr, profileType)
 	}
-
-	_, _ = fmt.Fprintf(
-		stderr, "auto-detected profile type: %s\n", *profileType,
-	)
 
 	return 0
 }
